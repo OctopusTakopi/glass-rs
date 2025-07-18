@@ -1,0 +1,28 @@
+[package]
+name = "glass-rs"
+version = "0.0.1"
+authors = ["OctopusTakopi"]
+description = "Rust implementation of glass: ordered set data structure for client-side order books."
+repository = "https://github.com/OctopusTakopi/glass-rs"
+readme = "README.md"
+keywords = ["data structure", "order book"]
+license = "MIT"
+edition = "2024"
+
+[dependencies]
+ahash = "0.8"
+
+[dev-dependencies]
+criterion = "0.6"
+rand = "0.9"
+
+[[bench]]
+name = "basic"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+incremental = false
+panic = "abort"
+strip = true
