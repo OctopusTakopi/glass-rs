@@ -6,20 +6,20 @@ use std::cell::{Cell, UnsafeCell};
 const BITS_PER_LEVEL: usize = 6; // Radix: 64 children per node
 const NUM_CHILDREN: usize = 1 << BITS_PER_LEVEL;
 const KEY_BITS: usize = 32;
-const LAST_BITS: usize = if KEY_BITS.is_multiple_of(BITS_PER_LEVEL) {
+const LAST_BITS: usize = if KEY_BITS % BITS_PER_LEVEL == 0 {
     BITS_PER_LEVEL
 } else {
     KEY_BITS % BITS_PER_LEVEL
 };
 const LAST_MASK: u64 = (1 << LAST_BITS) - 1;
-const NUM_LEVELS: usize = KEY_BITS.div_ceil(BITS_PER_LEVEL);
+const NUM_LEVELS: usize = (KEY_BITS + BITS_PER_LEVEL - 1) / BITS_PER_LEVEL;
 const MAX_SIZE: usize = 4096;
 const ARENA_CAPACITY: usize = 16384;
 
 struct GlassNode {
     mask: u64,
     value: Option<u64>,
-    count: u32, // New field: Number of keys in this subtree
+    count: u32,
     _padding: u32,
     children: [Option<usize>; NUM_CHILDREN],
 }
@@ -29,7 +29,7 @@ impl GlassNode {
         GlassNode {
             mask: 0,
             value: None,
-            count: 0, // Initialize count to 0
+            count: 0,
             _padding: 0,
             children: array::from_fn(|_| None),
         }
@@ -51,10 +51,11 @@ pub struct Glass {
 
     // Flags: manually packed
     preempt_bounds_valid: Cell<bool>, // 1
+    preempt_dirty: Cell<bool>,        // 1
     has_bmi2: bool,                   // 1
     has_bmi1: bool,                   // 1
     has_lzcnt: bool,                  // 1
-    _padding_flags: [u8; 4],          // pad to align next 8-byte field
+    _padding_flags: [u8; 3],          // pad to align next 8-byte field
 
     // Leaf node tracking
     min_leaf: Cell<Option<usize>>, // 16
@@ -64,6 +65,7 @@ pub struct Glass {
     cache: UnsafeCell<HashMap<u32, usize>>,       // 8
     preempt: UnsafeCell<HashMap<u32, u64>>,       // 8
     cached_path: UnsafeCell<[usize; NUM_LEVELS]>, // 8
+    sorted_preempt_keys: UnsafeCell<Vec<u32>>,    // 16
 
     arena: Vec<GlassNode>,  // 24
     free_list: Vec<usize>, // 24
@@ -88,24 +90,22 @@ impl Glass {
             cache: UnsafeCell::new(HashMap::new()),
             cached_path: UnsafeCell::new(cached_path),
             cached_d: Cell::new(0),
-            // size: Cell::new(0), // Removed
             min_leaf: Cell::new(None),
             max_leaf: Cell::new(None),
             preempt: UnsafeCell::new(HashMap::new()),
             preempt_bounds_valid: Cell::new(true),
-
+            sorted_preempt_keys: UnsafeCell::new(Vec::new()),
+            preempt_dirty: Cell::new(false),
             cached_last_key: Cell::new(None),
-
             min_key: Cell::new(u32::MAX),
             preempt_min: Cell::new(u32::MAX),
             thres: Cell::new(u32::MAX),
             max_key: Cell::new(0),
             preempt_max: Cell::new(0),
-
             has_bmi2: std::is_x86_feature_detected!("bmi2"),
             has_bmi1: std::is_x86_feature_detected!("bmi1"),
             has_lzcnt: std::is_x86_feature_detected!("lzcnt"),
-            _padding_flags: [0; 4],
+            _padding_flags: [0; 3],
         }
     }
 
@@ -133,6 +133,7 @@ impl Glass {
                         preempt.insert(worst_key, worst_v);
                     }
                     self.preempt_bounds_valid.set(false);
+                    self.preempt_dirty.set(true);
                 }
                 self.glass_insert(key, value);
             }
@@ -142,6 +143,7 @@ impl Glass {
                 preempt.insert(key, value);
             }
             self.preempt_bounds_valid.set(false);
+            self.preempt_dirty.set(true);
         }
     }
 
@@ -227,8 +229,10 @@ impl Glass {
                         self.preempt_min.set(u32::MAX);
                         self.preempt_max.set(0);
                         self.preempt_bounds_valid.set(true);
+                        self.preempt_dirty.set(false);
                     } else {
                         self.preempt_bounds_valid.set(false);
+                        self.preempt_dirty.set(true);
                     }
                 })
             }
@@ -341,8 +345,16 @@ impl Glass {
                 self.preempt_min.set(u32::MAX);
                 self.preempt_max.set(0);
             } else {
-                let new_min = *preempt.keys().min().unwrap_unchecked();
-                let new_max = *preempt.keys().max().unwrap_unchecked();
+                let mut new_min = u32::MAX;
+                let mut new_max = 0;
+                for &k in preempt.keys() {
+                    if k < new_min {
+                        new_min = k;
+                    }
+                    if k > new_max {
+                        new_max = k;
+                    }
+                }
                 self.thres.set(new_min);
                 self.preempt_min.set(new_min);
                 self.preempt_max.set(new_max);
@@ -377,6 +389,7 @@ impl Glass {
             self.glass_insert(k, v);
         }
         self.preempt_bounds_valid.set(false);
+        self.preempt_dirty.set(true);
     }
 
     #[inline(always)]
@@ -418,19 +431,124 @@ impl Glass {
         let mut total_cost = 0u64;
         self.glass_compute_buy_cost(&mut target_shares, &mut total_cost);
         if target_shares > 0 {
-            let mut keys: Vec<u32> = unsafe { &*self.preempt.get() }.keys().cloned().collect();
-            keys.sort_unstable();
-            for k in keys {
+            if self.preempt_dirty.get() {
+                let mut keys: Vec<u32> = unsafe { (*self.preempt.get()).keys().cloned().collect() };
+                keys.sort_unstable();
+                unsafe { *self.sorted_preempt_keys.get() = keys; }
+                self.preempt_dirty.set(false);
+            }
+            let sorted_keys = unsafe { &*self.sorted_preempt_keys.get() };
+            for &k in sorted_keys {
                 if target_shares == 0 {
                     break;
                 }
-                let avail_shares = *unsafe { &*self.preempt.get() }.get(&k).unwrap();
+                let avail_shares = *unsafe { (*self.preempt.get()).get(&k).unwrap() };
                 let buy = avail_shares.min(target_shares);
                 total_cost = total_cost.saturating_add((k as u64).saturating_mul(buy));
                 target_shares -= buy;
             }
         }
         total_cost
+    }
+
+    // #[inline(always)]
+    // fn glass_compute_buy_cost(&self, target_shares: &mut u64, total_cost: &mut u64) {
+    //     if *target_shares == 0 || self.arena[self.root].mask == 0 {
+    //         return;
+    //     }
+    //     let mut stack: Vec<StackItem> = Vec::with_capacity(NUM_LEVELS * 2);
+    //     stack.push(StackItem {
+    //         node_idx: self.root,
+    //         depth: 0,
+    //         key: 0,
+    //     });
+    //
+    //     while let Some(item) = stack.pop() {
+    //         if *target_shares == 0 {
+    //             break;
+    //         }
+    //         if item.depth as usize == NUM_LEVELS {
+    //             if let Some(avail_shares) = self.arena[item.node_idx].value {
+    //                 let buy = avail_shares.min(*target_shares);
+    //                 *total_cost += (item.key as u64) * buy; // Unsaturating
+    //                 *target_shares -= buy;
+    //             }
+    //             continue;
+    //         }
+    //
+    //         let mask = self.arena[item.node_idx].mask;
+    //         let bits_this_level =
+    //             BITS_PER_LEVEL.min(KEY_BITS.saturating_sub(item.depth as usize * BITS_PER_LEVEL));
+    //         // Fixed: correct masking to include all possible child bits 0..=(1<<bits_this_level)-1
+    //         let mut remaining_mask = mask;
+    //         let num_children_shift: u32 = 1u32 << bits_this_level as u32;
+    //         if (num_children_shift as u64) < 64 {
+    //             remaining_mask &= (1u64 << num_children_shift) - 1;
+    //         } // else: full mask for num_children_shift == 64
+    //
+    //         while remaining_mask != 0 && *target_shares > 0 {
+    //             let child_idx = if self.has_lzcnt {
+    //                 unsafe { (63 - _lzcnt_u64(remaining_mask)) as usize }
+    //             } else {
+    //                 63 - remaining_mask.leading_zeros() as usize
+    //             };
+    //             remaining_mask &= !(1u64 << child_idx); // Clear the bit
+    //             let shift = KEY_BITS.saturating_sub((item.depth as usize + 1) * BITS_PER_LEVEL);
+    //             let child_key = item.key | ((child_idx as u32) << shift);
+    //             let child_node_idx = self.arena[item.node_idx].children[child_idx].unwrap();
+    //             stack.push(StackItem {
+    //                 node_idx: child_node_idx,
+    //                 depth: item.depth + 1,
+    //                 key: child_key,
+    //             });
+    //         }
+    //     }
+    // }
+
+    #[inline(always)]
+    fn glass_compute_buy_cost(&self, target_shares: &mut u64, total_cost: &mut u64) {
+        if *target_shares == 0 || self.arena[self.root].mask == 0 {
+            return;
+        }
+        self.glass_compute_buy_cost_recursive(self.root, 0, 0, target_shares, total_cost);
+    }
+
+    #[inline(always)]
+    fn glass_compute_buy_cost_recursive(
+        &self,
+        node_idx: usize,
+        depth: usize,
+        key: u32,
+        target_shares: &mut u64,
+        total_cost: &mut u64
+    ) {
+        if *target_shares == 0 {
+            return;
+        }
+
+        if depth == NUM_LEVELS {
+            if let Some(avail_shares) = self.arena[node_idx].value {
+                let buy = avail_shares.min(*target_shares);
+                *total_cost += (key as u64) * buy;
+                *target_shares -= buy;
+            }
+            return;
+        }
+        let mask = self.arena[node_idx].mask;
+        let mut remaining_mask = mask;
+
+        while remaining_mask != 0 && *target_shares > 0 {
+            let child_idx = if self.has_bmi1 {
+                unsafe { _tzcnt_u64(remaining_mask) as usize }
+            } else {
+                remaining_mask.trailing_zeros() as usize
+            };
+            remaining_mask &= !(1u64 << child_idx);
+            let shift = KEY_BITS.saturating_sub((depth + 1) * BITS_PER_LEVEL);
+            let child_key = key | ((child_idx as u32) << shift);
+            let child_node_idx = self.arena[node_idx].children[child_idx].unwrap();
+            self.glass_compute_buy_cost_recursive(child_node_idx, depth + 1, child_key, target_shares, total_cost);
+        }
     }
 
     #[inline(always)]
@@ -785,49 +903,6 @@ impl Glass {
     }
 
     #[inline(always)]
-    fn glass_compute_buy_cost(&self, target_shares: &mut u64, total_cost: &mut u64) {
-        if *target_shares == 0 || self.arena[self.root].mask == 0 {
-            return;
-        }
-        let mut stack: Vec<StackItem> = Vec::with_capacity(NUM_LEVELS * 2);
-        stack.push(StackItem {
-            node_idx: self.root,
-            depth: 0,
-            key: 0,
-        });
-
-        while let Some(item) = stack.pop() {
-            if *target_shares == 0 {
-                break;
-            }
-            if item.depth as usize == NUM_LEVELS {
-                if let Some(avail_shares) = self.arena[item.node_idx].value {
-                    let buy = avail_shares.min(*target_shares);
-                    *total_cost = total_cost.saturating_add((item.key as u64).saturating_mul(buy));
-                    *target_shares -= buy;
-                }
-                continue;
-            }
-
-            let mask = self.arena[item.node_idx].mask;
-            let bits_this_level =
-                BITS_PER_LEVEL.min(KEY_BITS.saturating_sub(item.depth as usize * BITS_PER_LEVEL));
-            let mut child_idx_opt = self.find_prev_set_bit(mask, 1 << bits_this_level);
-            while let Some(child_idx) = child_idx_opt {
-                let shift = KEY_BITS.saturating_sub((item.depth as usize + 1) * BITS_PER_LEVEL);
-                let child_key = item.key | ((child_idx as u32) << shift);
-                let child_node_idx = self.arena[item.node_idx].children[child_idx].unwrap();
-                stack.push(StackItem {
-                    node_idx: child_node_idx,
-                    depth: item.depth + 1,
-                    key: child_key,
-                });
-                child_idx_opt = self.find_prev_set_bit(mask, child_idx);
-            }
-        }
-    }
-
-    #[inline(always)]
     fn find_next_set_bit(&self, mut mask: u64, start: usize) -> Option<usize> {
         if start >= NUM_CHILDREN {
             return None;
@@ -868,6 +943,7 @@ impl Glass {
     }
 }
 
+#[allow(dead_code)]
 struct StackItem {
     node_idx: usize,
     depth: u32,

@@ -101,7 +101,7 @@ Benchmarks were run on a c7i-flex.large with Intel(R) Xeon(R) Platinum 8488C (2)
 | Remove                | 15.84        | 53.21           | 3.36x                    |
 | Min                   | 2.38         | 5.16            | 2.17x                    |
 | Max                   | 1.89         | 5.36            | 2.84x                    |
-| Compute Buy Cost      | 87.11        | 8.99            | 0.10x (BTree faster)     |
+| Compute Buy Cost      | 40.12        | 6.72            | 0.17x (BTree faster)     |
 | Remove by Index (Start) | 99108      | 50169           | 0.51x (BTree faster)     |
 | Remove by Index (End) | 248310       | 1718200         | 6.92x                    |
 | Remove by Index (Random) | 262130    | 1044500         | 3.98x                    |
