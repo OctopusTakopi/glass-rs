@@ -1,6 +1,6 @@
 [package]
 name = "glass-rs"
-version = "0.0.1"
+version = "0.0.2"
 authors = ["OctopusTakopi"]
 description = "Rust implementation of glass: ordered set data structure for client-side order books."
 repository = "https://github.com/OctopusTakopi/glass-rs"

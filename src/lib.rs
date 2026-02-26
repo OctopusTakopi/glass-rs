@@ -1,74 +1,94 @@
 use ahash::AHashMap as HashMap;
 use std::arch::x86_64::*;
-use std::array;
 use std::cell::{Cell, UnsafeCell};
 
-const BITS_PER_LEVEL: usize = 6; // Radix: 64 children per node
+const BITS_PER_LEVEL: usize = 6;
 const NUM_CHILDREN: usize = 1 << BITS_PER_LEVEL;
-const KEY_BITS: usize = 32;
-const LAST_BITS: usize = if KEY_BITS % BITS_PER_LEVEL == 0 {
-    BITS_PER_LEVEL
-} else {
-    KEY_BITS % BITS_PER_LEVEL
-};
-const LAST_MASK: u64 = (1 << LAST_BITS) - 1;
-const NUM_LEVELS: usize = (KEY_BITS + BITS_PER_LEVEL - 1) / BITS_PER_LEVEL;
+const PAD_BITS: usize = 4; // 36 total bits -> 6 levels
+const NUM_LEVELS: usize = 6;
 const MAX_SIZE: usize = 4096;
+const HT_SIZE: usize = 4096;
 const ARENA_CAPACITY: usize = 16384;
+const LEAF_ARENA_CAPACITY: usize = 4096;
+const HT_MAX_LOOKUP_LEN: usize = 5;
 
-struct GlassNode {
+struct InternalNode {
     mask: u64,
-    value: Option<u64>,
     count: u32,
-    _padding: u32,
-    children: [Option<usize>; NUM_CHILDREN],
+    parent: u32,
+    children: [u32; NUM_CHILDREN],
 }
 
-impl GlassNode {
+impl InternalNode {
     fn new() -> Self {
-        GlassNode {
+        Self {
             mask: 0,
-            value: None,
             count: 0,
-            _padding: 0,
-            children: array::from_fn(|_| None),
+            parent: u32::MAX,
+            children: [u32::MAX; NUM_CHILDREN],
+        }
+    }
+}
+
+struct LeafNode {
+    mask: u64,
+    ht_next: u32,
+    ht_prev: u32,
+    ht_k: u32, // partial key (key >> 6)
+    next_leaf: u32,
+    prev_leaf: u32,
+    parent: u32,
+    values: [u64; NUM_CHILDREN],
+}
+
+impl LeafNode {
+    fn new() -> Self {
+        Self {
+            mask: 0,
+            ht_next: u32::MAX,
+            ht_prev: u32::MAX,
+            ht_k: u32::MAX,
+            next_leaf: u32::MAX,
+            prev_leaf: u32::MAX,
+            parent: u32::MAX,
+            values: [0; NUM_CHILDREN],
         }
     }
 }
 
 pub struct Glass {
     // === Hot frequently accessed fields ===
-    root: usize,                        // 8 bytes
-    cached_d: Cell<usize>,              // 8
-    cached_last_key: Cell<Option<u32>>, // 8
+    root: u32,
+    cached_d: Cell<u32>,
+    cached_last_key: Cell<Option<u32>>,
+    min_key: Cell<u32>,
+    max_key: Cell<u32>,
+    preempt_min: Cell<u32>,
+    preempt_max: Cell<u32>,
+    thres: Cell<u32>,
+    min_leaf: Cell<u32>,
+    max_leaf: Cell<u32>,
 
-    // Bounds and thresholds
-    min_key: Cell<u32>,     // 4
-    preempt_min: Cell<u32>, // 4
-    thres: Cell<u32>,       // 4
-    max_key: Cell<u32>,     // 4
-    preempt_max: Cell<u32>, // 4
+    // Flags
+    preempt_bounds_valid: Cell<bool>,
+    preempt_dirty: Cell<bool>,
+    has_bmi2: bool,
+    has_bmi1: bool,
+    has_lzcnt: bool,
+    _padding_flags: [u8; 3],
 
-    // Flags: manually packed
-    preempt_bounds_valid: Cell<bool>, // 1
-    preempt_dirty: Cell<bool>,        // 1
-    has_bmi2: bool,                   // 1
-    has_bmi1: bool,                   // 1
-    has_lzcnt: bool,                  // 1
-    _padding_flags: [u8; 3],          // pad to align next 8-byte field
+    // === Data structures ===
+    ht_heads: UnsafeCell<Vec<u32>>,
+    preempt: UnsafeCell<HashMap<u32, u64>>,
+    cached_path: UnsafeCell<[u32; 5]>, // Levels 0, 1, 2, 3, 4
+    cached_leaf: Cell<u32>,
+    sorted_preempt_keys: UnsafeCell<Vec<u32>>,
 
-    // Leaf node tracking
-    min_leaf: Cell<Option<usize>>, // 16
-    max_leaf: Cell<Option<usize>>, // 16
+    arena: Vec<InternalNode>,
+    free_list: Vec<u32>,
 
-    // === Larger cold/cached structures ===
-    cache: UnsafeCell<HashMap<u32, usize>>,       // 8
-    preempt: UnsafeCell<HashMap<u32, u64>>,       // 8
-    cached_path: UnsafeCell<[usize; NUM_LEVELS]>, // 8
-    sorted_preempt_keys: UnsafeCell<Vec<u32>>,    // 16
-
-    arena: Vec<GlassNode>,  // 24
-    free_list: Vec<usize>, // 24
+    leaf_arena: Vec<LeafNode>,
+    leaf_free_list: Vec<u32>,
 }
 
 impl Default for Glass {
@@ -80,38 +100,110 @@ impl Default for Glass {
 impl Glass {
     pub fn new() -> Self {
         let mut arena = Vec::with_capacity(ARENA_CAPACITY);
-        arena.push(GlassNode::new());
-        let mut cached_path = [0; NUM_LEVELS];
-        cached_path[0] = 0;
+        arena.push(InternalNode::new());
+        let ht_heads = vec![u32::MAX; HT_SIZE];
+
         Glass {
-            arena,
-            free_list: Vec::new(),
             root: 0,
-            cache: UnsafeCell::new(HashMap::new()),
-            cached_path: UnsafeCell::new(cached_path),
             cached_d: Cell::new(0),
-            min_leaf: Cell::new(None),
-            max_leaf: Cell::new(None),
-            preempt: UnsafeCell::new(HashMap::new()),
-            preempt_bounds_valid: Cell::new(true),
-            sorted_preempt_keys: UnsafeCell::new(Vec::new()),
-            preempt_dirty: Cell::new(false),
             cached_last_key: Cell::new(None),
             min_key: Cell::new(u32::MAX),
-            preempt_min: Cell::new(u32::MAX),
-            thres: Cell::new(u32::MAX),
             max_key: Cell::new(0),
+            preempt_min: Cell::new(u32::MAX),
             preempt_max: Cell::new(0),
+            thres: Cell::new(u32::MAX),
+            min_leaf: Cell::new(u32::MAX),
+            max_leaf: Cell::new(u32::MAX),
+            preempt_bounds_valid: Cell::new(true),
+            preempt_dirty: Cell::new(false),
             has_bmi2: std::is_x86_feature_detected!("bmi2"),
             has_bmi1: std::is_x86_feature_detected!("bmi1"),
             has_lzcnt: std::is_x86_feature_detected!("lzcnt"),
+            ht_heads: UnsafeCell::new(ht_heads),
+            preempt: UnsafeCell::new(HashMap::new()),
+            cached_path: UnsafeCell::new([0; 5]),
+            cached_leaf: Cell::new(u32::MAX),
+            sorted_preempt_keys: UnsafeCell::new(Vec::new()),
+            arena,
+            free_list: Vec::new(),
+            leaf_arena: Vec::with_capacity(LEAF_ARENA_CAPACITY),
+            leaf_free_list: Vec::new(),
             _padding_flags: [0; 3],
         }
     }
 
-    /// The number of elements currently stored in the glass structure.
     pub fn glass_size(&self) -> usize {
-        self.arena[self.root].count as usize
+        self.arena[self.root as usize].count as usize
+    }
+
+    #[inline(always)]
+    fn ensure_sorted_preempt_keys(&self) {
+        if self.preempt_dirty.get() {
+            unsafe {
+                let preempt = &*self.preempt.get();
+                let keys = &mut *self.sorted_preempt_keys.get();
+                *keys = preempt.keys().cloned().collect();
+                keys.sort_unstable();
+            }
+            self.preempt_dirty.set(false);
+        }
+    }
+
+    #[inline(always)]
+    fn ht_lookup(&self, partial_key: u32) -> Option<u32> {
+        let h = (partial_key as usize) & (HT_SIZE - 1);
+        let heads = unsafe { &*self.ht_heads.get() };
+        let mut curr = heads[h];
+        let mut lookups = 0;
+        while curr != u32::MAX && lookups < HT_MAX_LOOKUP_LEN {
+            let leaf = &self.leaf_arena[curr as usize];
+            if leaf.ht_k == partial_key {
+                return Some(curr);
+            }
+            curr = leaf.ht_next;
+            lookups += 1;
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn ht_insert(&mut self, leaf_idx: u32, partial_key: u32) {
+        let h = (partial_key as usize) & (HT_SIZE - 1);
+        let heads = unsafe { &mut *self.ht_heads.get() };
+        let old_head = heads[h];
+
+        let leaf = &mut self.leaf_arena[leaf_idx as usize];
+        leaf.ht_k = partial_key;
+        leaf.ht_next = old_head;
+        leaf.ht_prev = u32::MAX;
+
+        if old_head != u32::MAX {
+            self.leaf_arena[old_head as usize].ht_prev = leaf_idx;
+        }
+        heads[h] = leaf_idx;
+    }
+
+    #[inline(always)]
+    fn ht_remove(&mut self, leaf_idx: u32) {
+        let leaf = &mut self.leaf_arena[leaf_idx as usize];
+        let prev = leaf.ht_prev;
+        let next = leaf.ht_next;
+        let partial_key = leaf.ht_k;
+        
+        leaf.ht_k = u32::MAX;
+        leaf.ht_next = u32::MAX;
+        leaf.ht_prev = u32::MAX;
+
+        if prev != u32::MAX {
+            self.leaf_arena[prev as usize].ht_next = next;
+        } else {
+            let h = (partial_key as usize) & (HT_SIZE - 1);
+            unsafe { (&mut *self.ht_heads.get())[h] = next };
+        }
+
+        if next != u32::MAX {
+            self.leaf_arena[next as usize].ht_prev = prev;
+        }
     }
 
     #[inline(always)]
@@ -120,22 +212,35 @@ impl Glass {
             self.remove(key);
             return;
         }
-        if self.get(key).is_some() {
-            self.update_value(key, |v| *v = value);
-        } else if self.check_bounds_and_thres(key) {
+        if self.update_value(key, |v| *v = value) {
+            return;
+        }
+
+        if self.check_bounds_and_thres(key) {
             if self.glass_size() < MAX_SIZE {
                 self.glass_insert(key, value);
             } else {
                 if let Some((worst_key, worst_v)) = self.glass_max() {
-                    self.glass_remove(worst_key);
-                    unsafe {
-                        let preempt = &mut *self.preempt.get();
-                        preempt.insert(worst_key, worst_v);
+                    if key < worst_key {
+                        self.glass_remove(worst_key);
+                        unsafe {
+                            let preempt = &mut *self.preempt.get();
+                            preempt.insert(worst_key, worst_v);
+                        }
+                        self.preempt_bounds_valid.set(false);
+                        self.preempt_dirty.set(true);
+                        self.glass_insert(key, value);
+                    } else {
+                        unsafe {
+                            let preempt = &mut *self.preempt.get();
+                            preempt.insert(key, value);
+                        }
+                        self.preempt_bounds_valid.set(false);
+                        self.preempt_dirty.set(true);
                     }
-                    self.preempt_bounds_valid.set(false);
-                    self.preempt_dirty.set(true);
+                } else {
+                    self.glass_insert(key, value);
                 }
-                self.glass_insert(key, value);
             }
         } else {
             unsafe {
@@ -156,40 +261,26 @@ impl Glass {
         }
     }
 
-    /// Removes and returns the k-th smallest element from the entire collection (glass + preempt).
-    ///
-    /// The overall sorted order is all glass elements followed by all preempt elements.
-    /// Complexity is dominated by sorting the preempt map's keys if the index `k`
-    /// falls within the preempt map's range.
-    ///
-    /// # Arguments
-    /// * `k`: The 0-based index of the element to remove.
-    ///
-    /// # Returns
-    /// `Some((key, value))` of the removed element, or `None` if `k` is out of bounds.
     #[inline(always)]
     pub fn remove_by_index(&mut self, k: usize) -> Option<(u32, u64)> {
+        if k == 0 {
+            return self.min().and_then(|(key, _)| self.remove(key).map(|v| (key, v)));
+        }
+        
         let glass_size = self.glass_size();
 
         let key_to_remove = if k < glass_size {
-            // The k-th element is in the glass. Find its key.
             self.glass_find_kth_key(k)?
         } else {
-            // The k-th element is in the preempt map.
             let preempt_k = k - glass_size;
-            let preempt_map = unsafe { &*self.preempt.get() };
-            if preempt_k >= preempt_map.len() {
-                return None; // k is out of bounds.
+            self.ensure_sorted_preempt_keys();
+            let keys = unsafe { &*self.sorted_preempt_keys.get() };
+            if preempt_k >= keys.len() {
+                return None;
             }
-
-            // This is O(M log M) where M is preempt size, but unavoidable for a HashMap.
-            let mut keys: Vec<u32> = preempt_map.keys().cloned().collect();
-            keys.sort_unstable();
             keys[preempt_k]
         };
 
-        // Use the existing general-purpose remove function, which will correctly
-        // handle state changes (including glass counts).
         self.remove(key_to_remove)
             .map(|value| (key_to_remove, value))
     }
@@ -218,8 +309,11 @@ impl Glass {
     #[inline(always)]
     pub fn remove(&mut self, key: u32) -> Option<u64> {
         if self.check_bounds_and_thres(key) {
-            // glass_remove now handles count updates, so we don't need to manage `size` here.
-            self.glass_remove(key)
+            let res = self.glass_remove(key);
+            if res.is_some() && self.glass_size() < MAX_SIZE {
+                self.restructure();
+            }
+            res
         } else {
             unsafe {
                 let preempt = &mut *self.preempt.get();
@@ -371,15 +465,12 @@ impl Glass {
         }
         let n = MAX_SIZE - sigma;
 
+        self.ensure_sorted_preempt_keys();
         let mut to_move = vec![];
         unsafe {
             let preempt = &mut *self.preempt.get();
-            if preempt.is_empty() {
-                return;
-            }
-            let mut keys_vec: Vec<u32> = preempt.keys().cloned().collect();
-            keys_vec.sort_unstable();
-            for k in keys_vec.into_iter().take(n) {
+            let keys = &*self.sorted_preempt_keys.get();
+            for &k in keys.iter().take(n) {
                 if let Some(v) = preempt.remove(&k) {
                     to_move.push((k, v));
                 }
@@ -401,23 +492,15 @@ impl Glass {
         }
 
         while shares_to_buy > 0 {
-            if let Some((price, _)) = self.glass_min() {
-                let mut is_empty = false;
-                let updated = self.update_value(price, |avail| {
-                    let buy = (*avail).min(shares_to_buy);
-                    total_cost += (price as u64) * buy;
-                    *avail -= buy;
-                    shares_to_buy -= buy;
-                    is_empty = *avail == 0;
-                });
-
-                if updated && is_empty {
+            if let Some((price, avail_at_price)) = self.min() {
+                if avail_at_price <= shares_to_buy {
+                    total_cost += (price as u64) * avail_at_price;
+                    shares_to_buy -= avail_at_price;
                     self.remove(price);
-                    if self.glass_size() < MAX_SIZE {
-                        self.restructure();
-                    }
-                } else if !updated {
-                    break;
+                } else {
+                    total_cost += (price as u64) * shares_to_buy;
+                    self.update_value(price, |avail| *avail -= shares_to_buy);
+                    shares_to_buy = 0;
                 }
             } else {
                 break;
@@ -429,14 +512,45 @@ impl Glass {
     #[inline(always)]
     pub fn compute_buy_cost(&self, mut target_shares: u64) -> u64 {
         let mut total_cost = 0u64;
-        self.glass_compute_buy_cost(&mut target_shares, &mut total_cost);
-        if target_shares > 0 {
-            if self.preempt_dirty.get() {
-                let mut keys: Vec<u32> = unsafe { (*self.preempt.get()).keys().cloned().collect() };
-                keys.sort_unstable();
-                unsafe { *self.sorted_preempt_keys.get() = keys; }
-                self.preempt_dirty.set(false);
+        
+        let mut curr_leaf_idx = self.min_leaf.get();
+        while curr_leaf_idx != u32::MAX && target_shares > 0 {
+            let leaf = &self.leaf_arena[curr_leaf_idx as usize];
+            let base_key = leaf.ht_k << BITS_PER_LEVEL;
+            let mut mask = leaf.mask;
+            
+            // For the very first leaf, we might need to skip some bits
+            if base_key == (self.min_key.get() & !0x3F) {
+                let start_slot = (self.min_key.get() & 0x3F) as usize;
+                mask &= !((1u64 << start_slot) - 1);
             }
+
+            while mask != 0 {
+                let slot = if self.has_bmi1 {
+                    unsafe { _tzcnt_u64(mask) as usize }
+                } else {
+                    mask.trailing_zeros() as usize
+                };
+                
+                let price = base_key | (slot as u32);
+                let qty = leaf.values[slot];
+                let buy = qty.min(target_shares);
+                total_cost = total_cost.saturating_add((price as u64).saturating_mul(buy));
+                target_shares -= buy;
+                
+                if target_shares == 0 { return total_cost; }
+                
+                if self.has_bmi1 {
+                    unsafe { mask = _blsr_u64(mask); }
+                } else {
+                    mask &= !(1u64 << slot);
+                }
+            }
+            curr_leaf_idx = leaf.next_leaf;
+        }
+        
+        if target_shares > 0 {
+            self.ensure_sorted_preempt_keys();
             let sorted_keys = unsafe { &*self.sorted_preempt_keys.get() };
             for &k in sorted_keys {
                 if target_shares == 0 {
@@ -451,748 +565,369 @@ impl Glass {
         total_cost
     }
 
-    // #[inline(always)]
-    // fn glass_compute_buy_cost(&self, target_shares: &mut u64, total_cost: &mut u64) {
-    //     if *target_shares == 0 || self.arena[self.root].mask == 0 {
-    //         return;
-    //     }
-    //     let mut stack: Vec<StackItem> = Vec::with_capacity(NUM_LEVELS * 2);
-    //     stack.push(StackItem {
-    //         node_idx: self.root,
-    //         depth: 0,
-    //         key: 0,
-    //     });
-    //
-    //     while let Some(item) = stack.pop() {
-    //         if *target_shares == 0 {
-    //             break;
-    //         }
-    //         if item.depth as usize == NUM_LEVELS {
-    //             if let Some(avail_shares) = self.arena[item.node_idx].value {
-    //                 let buy = avail_shares.min(*target_shares);
-    //                 *total_cost += (item.key as u64) * buy; // Unsaturating
-    //                 *target_shares -= buy;
-    //             }
-    //             continue;
-    //         }
-    //
-    //         let mask = self.arena[item.node_idx].mask;
-    //         let bits_this_level =
-    //             BITS_PER_LEVEL.min(KEY_BITS.saturating_sub(item.depth as usize * BITS_PER_LEVEL));
-    //         // Fixed: correct masking to include all possible child bits 0..=(1<<bits_this_level)-1
-    //         let mut remaining_mask = mask;
-    //         let num_children_shift: u32 = 1u32 << bits_this_level as u32;
-    //         if (num_children_shift as u64) < 64 {
-    //             remaining_mask &= (1u64 << num_children_shift) - 1;
-    //         } // else: full mask for num_children_shift == 64
-    //
-    //         while remaining_mask != 0 && *target_shares > 0 {
-    //             let child_idx = if self.has_lzcnt {
-    //                 unsafe { (63 - _lzcnt_u64(remaining_mask)) as usize }
-    //             } else {
-    //                 63 - remaining_mask.leading_zeros() as usize
-    //             };
-    //             remaining_mask &= !(1u64 << child_idx); // Clear the bit
-    //             let shift = KEY_BITS.saturating_sub((item.depth as usize + 1) * BITS_PER_LEVEL);
-    //             let child_key = item.key | ((child_idx as u32) << shift);
-    //             let child_node_idx = self.arena[item.node_idx].children[child_idx].unwrap();
-    //             stack.push(StackItem {
-    //                 node_idx: child_node_idx,
-    //                 depth: item.depth + 1,
-    //                 key: child_key,
-    //             });
-    //         }
-    //     }
-    // }
-
     #[inline(always)]
-    fn glass_compute_buy_cost(&self, target_shares: &mut u64, total_cost: &mut u64) {
-        if *target_shares == 0 || self.arena[self.root].mask == 0 {
-            return;
-        }
-        self.glass_compute_buy_cost_recursive(self.root, 0, 0, target_shares, total_cost);
-    }
-
-    #[inline(always)]
-    fn glass_compute_buy_cost_recursive(
-        &self,
-        node_idx: usize,
-        depth: usize,
-        key: u32,
-        target_shares: &mut u64,
-        total_cost: &mut u64
-    ) {
-        if *target_shares == 0 {
-            return;
-        }
-
-        if depth == NUM_LEVELS {
-            if let Some(avail_shares) = self.arena[node_idx].value {
-                let buy = avail_shares.min(*target_shares);
-                *total_cost += (key as u64) * buy;
-                *target_shares -= buy;
-            }
-            return;
-        }
-        let mask = self.arena[node_idx].mask;
-        let mut remaining_mask = mask;
-
-        while remaining_mask != 0 && *target_shares > 0 {
-            let child_idx = if self.has_bmi1 {
-                unsafe { _tzcnt_u64(remaining_mask) as usize }
-            } else {
-                remaining_mask.trailing_zeros() as usize
-            };
-            remaining_mask &= !(1u64 << child_idx);
-            let shift = KEY_BITS.saturating_sub((depth + 1) * BITS_PER_LEVEL);
-            let child_key = key | ((child_idx as u32) << shift);
-            let child_node_idx = self.arena[node_idx].children[child_idx].unwrap();
-            self.glass_compute_buy_cost_recursive(child_node_idx, depth + 1, child_key, target_shares, total_cost);
-        }
+    fn get_common_prefix_depth(&self, key: u32, lk: u32) -> usize {
+        let xor = key ^ lk;
+        let lz = xor.leading_zeros() as usize;
+        let virtual_lz = lz + PAD_BITS;
+        virtual_lz / BITS_PER_LEVEL
     }
 
     #[inline(always)]
     fn glass_insert(&mut self, key: u32, value: u64) {
-        let partial = key >> LAST_BITS;
+        let partial = key >> BITS_PER_LEVEL;
+        
         let mut level = 0usize;
         let mut node_idx = self.root;
+        let mut leaf_idx = u32::MAX;
 
-        // --- Path caching for traversal speed ---
-        if let Some(lk) = self.cached_last_key.get() {
-            let xor = key ^ lk;
-            let common_bits = xor.leading_zeros() as usize;
-            let lambda = common_bits / BITS_PER_LEVEL;
-            level = self.cached_d.get().min(lambda);
-            if level > 0 {
-                node_idx = unsafe { (*self.cached_path.get())[level] };
-            }
+        if let Some(l_idx) = self.ht_lookup(partial) {
+            leaf_idx = l_idx;
         }
 
-        // --- Traverse and create nodes ---
-        let current_key = key as u64;
-        for l in level..NUM_LEVELS {
-            let shift = KEY_BITS.saturating_sub((l + 1) * BITS_PER_LEVEL);
-            let bits_this_level = BITS_PER_LEVEL.min(KEY_BITS.saturating_sub(l * BITS_PER_LEVEL));
-            let child_mask = (1u64 << bits_this_level) - 1;
-            let child_slot = ((current_key >> shift) & child_mask) as usize;
-
-            if self.arena[node_idx].children[child_slot].is_none() {
-                let new_idx = if let Some(idx) = self.free_list.pop() {
-                    self.arena[idx] = GlassNode::new();
-                    idx
-                } else {
-                    let idx = self.arena.len();
-                    self.arena.push(GlassNode::new());
-                    idx
-                };
-                self.arena[node_idx].children[child_slot] = Some(new_idx);
-                self.arena[node_idx].mask |= 1u64 << child_slot;
-            }
-            if l == NUM_LEVELS - 1 {
-                unsafe {
-                    (*self.cache.get()).entry(partial).or_insert(node_idx);
+        if leaf_idx != u32::MAX {
+            if let Some(lk) = self.cached_last_key.get() {
+                let depth = self.get_common_prefix_depth(key, lk);
+                level = (self.cached_d.get() as usize).min(depth);
+                if level > 0 {
+                    if level < NUM_LEVELS - 1 {
+                        node_idx = unsafe { (*self.cached_path.get())[level] };
+                    }
                 }
             }
-            unsafe {
-                (*self.cached_path.get())[l] = node_idx;
+            
+            for l in level..NUM_LEVELS - 1 {
+                unsafe { (*self.cached_path.get())[l] = node_idx };
+                let shift = (NUM_LEVELS - 1 - l) * BITS_PER_LEVEL;
+                let child_slot = ((key >> shift) & 0x3F) as usize;
+                node_idx = self.arena[node_idx as usize].children[child_slot];
             }
-            node_idx = self.arena[node_idx].children[child_slot].unwrap();
+            let leaf = &mut self.leaf_arena[leaf_idx as usize];
+            let leaf_slot = (key & 0x3F) as usize;
+            if leaf.values[leaf_slot] == 0 {
+                leaf.mask |= 1u64 << leaf_slot;
+                for l in 0..NUM_LEVELS - 1 {
+                    let ancestor_idx = unsafe { (*self.cached_path.get())[l] };
+                    self.arena[ancestor_idx as usize].count += 1;
+                }
+            }
+            leaf.values[leaf_slot] = value;
+            
+            self.cached_last_key.set(Some(key));
+            self.cached_d.set(NUM_LEVELS as u32);
+            self.cached_leaf.set(leaf_idx);
+            
+            if key < self.min_key.get() {
+                self.min_key.set(key);
+                self.min_leaf.set(leaf_idx);
+            }
+            if key > self.max_key.get() {
+                self.max_key.set(key);
+                self.max_leaf.set(leaf_idx);
+            }
+            return;
         }
 
-        // --- Update leaf and counts ---
-        self.arena[node_idx].value = Some(value);
-        self.arena[node_idx].count = 1; // A leaf with a value has a count of 1.
-
-        // Increment counts of all ancestors on the path.
-        for l in 0..NUM_LEVELS {
-            let ancestor_idx = unsafe { (*self.cached_path.get())[l] };
-            self.arena[ancestor_idx].count += 1;
+        if let Some(lk) = self.cached_last_key.get() {
+            let depth = self.get_common_prefix_depth(key, lk);
+            level = (self.cached_d.get() as usize).min(depth);
+            if level > 0 {
+                if level < NUM_LEVELS - 1 {
+                    node_idx = unsafe { (*self.cached_path.get())[level] };
+                } else {
+                    leaf_idx = self.cached_leaf.get();
+                }
+            }
         }
 
-        // --- Update global state ---
+        for l in level..NUM_LEVELS - 1 {
+            let shift = (NUM_LEVELS - 1 - l) * BITS_PER_LEVEL;
+            let child_slot = ((key >> shift) & 0x3F) as usize;
+
+            if l == NUM_LEVELS - 2 { 
+                if self.arena[node_idx as usize].children[child_slot] == u32::MAX {
+                    let new_leaf_idx = if let Some(idx) = self.leaf_free_list.pop() {
+                        self.leaf_arena[idx as usize] = LeafNode::new();
+                        idx
+                    } else {
+                        let idx = self.leaf_arena.len() as u32;
+                        self.leaf_arena.push(LeafNode::new());
+                        idx
+                    };
+                    
+                    self.arena[node_idx as usize].children[child_slot] = new_leaf_idx;
+                    self.arena[node_idx as usize].mask |= 1u64 << child_slot;
+                    
+                    let (prev_l, next_l) = self.find_neighbor_leaves(key);
+                    {
+                        let new_leaf = &mut self.leaf_arena[new_leaf_idx as usize];
+                        new_leaf.parent = node_idx;
+                        new_leaf.prev_leaf = prev_l;
+                        new_leaf.next_leaf = next_l;
+                    }
+                    if prev_l != u32::MAX { self.leaf_arena[prev_l as usize].next_leaf = new_leaf_idx; }
+                    else { self.min_leaf.set(new_leaf_idx); }
+                    if next_l != u32::MAX { self.leaf_arena[next_l as usize].prev_leaf = new_leaf_idx; }
+                    else { self.max_leaf.set(new_leaf_idx); }
+                    
+                    self.ht_insert(new_leaf_idx, partial);
+                }
+                unsafe { (*self.cached_path.get())[l] = node_idx };
+                leaf_idx = self.arena[node_idx as usize].children[child_slot];
+            } else { 
+                if self.arena[node_idx as usize].children[child_slot] == u32::MAX {
+                    let new_idx = if let Some(idx) = self.free_list.pop() {
+                        self.arena[idx as usize] = InternalNode::new();
+                        idx
+                    } else {
+                        let idx = self.arena.len() as u32;
+                        self.arena.push(InternalNode::new());
+                        idx
+                    };
+                    self.arena[new_idx as usize].parent = node_idx;
+                    self.arena[node_idx as usize].children[child_slot] = new_idx;
+                    self.arena[node_idx as usize].mask |= 1u64 << child_slot;
+                }
+                unsafe { (*self.cached_path.get())[l] = node_idx };
+                node_idx = self.arena[node_idx as usize].children[child_slot];
+            }
+        }
+
+        let leaf = &mut self.leaf_arena[leaf_idx as usize];
+        let leaf_slot = (key & 0x3F) as usize;
+        
+        if leaf.values[leaf_slot] == 0 {
+            leaf.mask |= 1u64 << leaf_slot;
+            for l in 0..NUM_LEVELS - 1 {
+                let ancestor_idx = unsafe { (*self.cached_path.get())[l] };
+                self.arena[ancestor_idx as usize].count += 1;
+            }
+        }
+        leaf.values[leaf_slot] = value;
+
         self.cached_last_key.set(Some(key));
-        self.cached_d.set(NUM_LEVELS);
+        self.cached_d.set(NUM_LEVELS as u32);
+        self.cached_leaf.set(leaf_idx);
 
-        if key < self.min_key.get() {
-            self.min_key.set(key);
-            self.min_leaf.set(Some(node_idx));
+        if key < self.min_key.get() { self.min_key.set(key); self.min_leaf.set(leaf_idx); }
+        if key > self.max_key.get() { self.max_key.set(key); self.max_leaf.set(leaf_idx); }
+    }
+
+    #[inline(always)]
+    fn find_neighbor_leaves(&self, key: u32) -> (u32, u32) {
+        let mut prev = u32::MAX;
+        let mut next = u32::MAX;
+        
+        let mut node_idx = self.root;
+        for depth in 0..NUM_LEVELS - 1 {
+            let node = &self.arena[node_idx as usize];
+            let shift = (NUM_LEVELS - 1 - depth) * BITS_PER_LEVEL;
+            let slot = ((key >> shift) & 0x3F) as usize;
+            
+            if let Some(p_slot) = self.find_prev_set_bit(node.mask, slot) {
+                let mut curr = node.children[p_slot];
+                for _d2 in depth+1..NUM_LEVELS - 1 {
+                    let n2 = &self.arena[curr as usize];
+                    let s2 = self.find_prev_set_bit(n2.mask, NUM_CHILDREN).unwrap();
+                    curr = n2.children[s2];
+                }
+                prev = curr;
+            }
+            if let Some(n_slot) = self.find_next_set_bit(node.mask, slot + 1) {
+                let mut curr = node.children[n_slot];
+                for _d2 in depth+1..NUM_LEVELS - 1 {
+                    let n2 = &self.arena[curr as usize];
+                    let s2 = self.find_next_set_bit(n2.mask, 0).unwrap();
+                    curr = n2.children[s2];
+                }
+                next = curr;
+            }
+            
+            let next_node = node.children[slot];
+            if next_node == u32::MAX { break; }
+            node_idx = next_node;
         }
-        if key > self.max_key.get() {
-            self.max_key.set(key);
-            self.max_leaf.set(Some(node_idx));
-        }
+        (prev, next)
     }
 
     #[inline(always)]
     fn glass_get(&self, key: u32) -> Option<u64> {
-        let partial = key >> LAST_BITS;
-        let last = (key & (LAST_MASK as u32)) as usize;
-        if let Some(preleaf_idx) = unsafe { (*self.cache.get()).get(&partial).copied() }
-            && let Some(leaf_idx) = self.arena[preleaf_idx].children[last]
-        {
-            return self.arena[leaf_idx].value;
-        }
-
-        let mut level = 0usize;
-        let mut node_idx = self.root;
-
-        if let Some(lk) = self.cached_last_key.get() {
-            let xor = key ^ lk;
-            let common_bits = xor.leading_zeros() as usize;
-            let lambda = common_bits / BITS_PER_LEVEL;
-            level = self.cached_d.get().min(lambda);
-            if level > 0 {
-                node_idx = unsafe { (*self.cached_path.get())[level] };
+        let partial = key >> BITS_PER_LEVEL;
+        if let Some(leaf_idx) = self.ht_lookup(partial) {
+            let v = self.leaf_arena[leaf_idx as usize].values[(key & 0x3F) as usize];
+            if v > 0 {
+                return Some(v);
             }
         }
-
-        let current_key = key as u64;
-        for l in level..NUM_LEVELS {
-            let shift = KEY_BITS.saturating_sub((l + 1) * BITS_PER_LEVEL);
-            let bits_this_level = BITS_PER_LEVEL.min(KEY_BITS.saturating_sub(l * BITS_PER_LEVEL));
-            let child_mask = (1u64 << bits_this_level) - 1;
-            let child_slot = ((current_key >> shift) & child_mask) as usize;
-
-            if l == NUM_LEVELS - 1 {
-                unsafe {
-                    (*self.cache.get()).entry(partial).or_insert(node_idx);
-                }
-            }
-            if let Some(child) = self.arena[node_idx].children[child_slot] {
-                unsafe { (*self.cached_path.get())[l] = node_idx };
-                node_idx = child;
-            } else {
-                return None;
-            }
-        }
-        let val = self.arena[node_idx].value;
-        if val.is_some() {
-            self.cached_last_key.set(Some(key));
-            self.cached_d.set(NUM_LEVELS);
-        }
-        val
+        None
     }
 
     #[inline(always)]
     fn glass_get_mut(&mut self, key: u32) -> Option<&mut u64> {
-        let partial = key >> LAST_BITS;
-        let last = (key & (LAST_MASK as u32)) as usize;
-        if let Some(preleaf_idx) = unsafe { (*self.cache.get()).get(&partial).copied() }
-            && let Some(leaf_idx) = self.arena[preleaf_idx].children[last]
-        {
-            return self.arena[leaf_idx].value.as_mut();
-        }
-
-        let mut level = 0usize;
-        let mut node_idx = self.root;
-
-        if let Some(lk) = self.cached_last_key.get() {
-            let xor = key ^ lk;
-            let common_bits = xor.leading_zeros() as usize;
-            let lambda = common_bits / BITS_PER_LEVEL;
-            level = self.cached_d.get().min(lambda);
-            if level > 0 {
-                node_idx = unsafe { (*self.cached_path.get())[level] };
+        let partial = key >> BITS_PER_LEVEL;
+        if let Some(leaf_idx) = self.ht_lookup(partial) {
+            let v = &mut self.leaf_arena[leaf_idx as usize].values[(key & 0x3F) as usize];
+            if *v > 0 {
+                return Some(v);
             }
         }
-
-        let current_key = key as u64;
-        for l in level..NUM_LEVELS {
-            let shift = KEY_BITS.saturating_sub((l + 1) * BITS_PER_LEVEL);
-            let bits_this_level = BITS_PER_LEVEL.min(KEY_BITS.saturating_sub(l * BITS_PER_LEVEL));
-            let child_mask = (1u64 << bits_this_level) - 1;
-            let child_slot = ((current_key >> shift) & child_mask) as usize;
-
-            if l == NUM_LEVELS - 1 {
-                unsafe {
-                    (*self.cache.get()).entry(partial).or_insert(node_idx);
-                }
-            }
-            if let Some(child) = self.arena[node_idx].children[child_slot] {
-                unsafe { (*self.cached_path.get())[l] = node_idx };
-                node_idx = child;
-            } else {
-                return None;
-            }
-        }
-        if self.arena[node_idx].value.is_some() {
-            self.cached_last_key.set(Some(key));
-            self.cached_d.set(NUM_LEVELS);
-        }
-        self.arena[node_idx].value.as_mut()
+        None
     }
 
     #[inline(always)]
     fn glass_remove(&mut self, key: u32) -> Option<u64> {
-        let partial = key >> LAST_BITS;
-        let mut path: [(usize, usize); NUM_LEVELS] = [(0, 0); NUM_LEVELS];
-        let mut path_len = 0;
+        let partial = key >> BITS_PER_LEVEL;
+        let leaf_idx = self.ht_lookup(partial)?;
+        let leaf_slot = (key & 0x3F) as usize;
+        let removed_val = self.leaf_arena[leaf_idx as usize].values[leaf_slot];
+        if removed_val == 0 { return None; }
+
         let mut node_idx = self.root;
-        let current_key = key as u64;
+        let mut path: [(u32, usize); NUM_LEVELS - 1] = [(0, 0); NUM_LEVELS - 1];
+        for l in 0..NUM_LEVELS - 1 {
+            let shift = (NUM_LEVELS - 1 - l) * BITS_PER_LEVEL;
+            let child_slot = ((key >> shift) & 0x3F) as usize;
+            path[l] = (node_idx, child_slot);
+            node_idx = self.arena[node_idx as usize].children[child_slot];
+        }
 
-        for l in 0..NUM_LEVELS {
-            let shift = KEY_BITS.saturating_sub((l + 1) * BITS_PER_LEVEL);
-            let bits_this_level = BITS_PER_LEVEL.min(KEY_BITS.saturating_sub(l * BITS_PER_LEVEL));
-            let child_mask = (1u64 << bits_this_level) - 1;
-            let child_slot = ((current_key >> shift) & child_mask) as usize;
-            if l == NUM_LEVELS - 1 {
-                unsafe {
-                    (*self.cache.get()).entry(partial).or_insert(node_idx);
-                }
-            }
-            if let Some(child) = self.arena[node_idx].children[child_slot] {
-                path[path_len] = (node_idx, child_slot);
-                path_len += 1;
-                node_idx = child;
-            } else {
-                return None;
+        let leaf = &mut self.leaf_arena[leaf_idx as usize];
+        leaf.values[leaf_slot] = 0;
+        leaf.mask &= !(1u64 << leaf_slot);
+        for (parent_idx, _) in path.iter() { self.arena[*parent_idx as usize].count -= 1; }
+
+        if leaf.mask == 0 {
+            let p_l = leaf.prev_leaf;
+            let n_l = leaf.next_leaf;
+            if p_l != u32::MAX { self.leaf_arena[p_l as usize].next_leaf = n_l; }
+            else { self.min_leaf.set(n_l); }
+            if n_l != u32::MAX { self.leaf_arena[n_l as usize].prev_leaf = p_l; }
+            else { self.max_leaf.set(p_l); }
+
+            self.ht_remove(leaf_idx);
+            self.leaf_free_list.push(leaf_idx);
+            for l in (0..NUM_LEVELS - 1).rev() {
+                let (parent, slot) = path[l];
+                self.arena[parent as usize].children[slot] = u32::MAX;
+                self.arena[parent as usize].mask &= !(1u64 << slot);
+                if self.arena[parent as usize].mask == 0 && l > 0 { self.free_list.push(parent); }
+                else { break; }
             }
         }
 
-        let removed = self.arena[node_idx].value.take();
-        if removed.is_some() {
-            // Key existed and was removed. Update counts.
-            self.arena[node_idx].count = 0;
-            for (parent_idx, _) in path.iter().take(path_len) {
-                self.arena[*parent_idx].count -= 1;
-            }
-        } else {
-            return None; // Key not found
-        }
-
-        // --- Prune empty branches ---
-        let mut current = node_idx;
-        let mut pruned_count = 0;
-        let is_last_key = self.cached_last_key.get() == Some(key);
-
-        let mut i = path_len;
-        while i > 0 {
-            i -= 1;
-            let (parent, slot) = path[i];
-            if self.arena[current].value.is_some() || self.arena[current].mask != 0 {
-                break;
-            }
-            self.arena[parent].children[slot] = None;
-            self.arena[parent].mask &= !(1u64 << slot);
-            self.free_list.push(current);
-
-            if i == path_len - 1 && self.arena[parent].mask == 0 {
-                unsafe {
-                    (*self.cache.get()).remove(&partial);
-                }
-            }
-            pruned_count += 1;
-            current = parent;
-        }
-
-        if is_last_key {
-            self.cached_d
-                .set(self.cached_d.get().saturating_sub(pruned_count));
-        }
-
+        if self.cached_last_key.get() == Some(key) { self.cached_last_key.set(None); self.cached_d.set(0); }
         if key == self.min_key.get() {
-            self.min_key.set(u32::MAX);
-            self.min_leaf.set(None);
+            if let Some((nk, _)) = self.glass_find_extreme(true) { self.min_key.set(nk); }
+            else { self.min_key.set(u32::MAX); self.min_leaf.set(u32::MAX); }
         }
         if key == self.max_key.get() {
-            self.max_key.set(0);
-            self.max_leaf.set(None);
+            if let Some((nk, _)) = self.glass_find_extreme(false) { self.max_key.set(nk); }
+            else { self.max_key.set(0); self.max_leaf.set(u32::MAX); }
         }
-        removed
+        Some(removed_val)
     }
 
-    /// Finds the key of the k-th smallest element in the glass.
     #[inline(always)]
     fn glass_find_kth_key(&self, mut k: usize) -> Option<u32> {
-        if k >= self.glass_size() {
-            return None;
-        }
-
+        if k >= self.glass_size() { return None; }
         let mut node_idx = self.root;
         let mut key = 0u32;
-
-        'level_loop: for depth in 0..NUM_LEVELS {
-            let node = &self.arena[node_idx];
-            let mut start_search_idx = 0;
+        for depth in 0..NUM_LEVELS - 1 {
+            let node = &self.arena[node_idx as usize];
+            let mut start = 0;
             loop {
-                // Find the next child in ascending order
-                if let Some(child_slot) = self.find_next_set_bit(node.mask, start_search_idx) {
-                    let child_idx = node.children[child_slot].unwrap();
-                    let child_count = self.arena[child_idx].count as usize;
-
-                    if k < child_count {
-                        // The k-th element is in this child's subtree. Descend.
-                        let shift = KEY_BITS.saturating_sub((depth + 1) * BITS_PER_LEVEL);
-                        key |= (child_slot as u32) << shift;
+                if let Some(slot) = self.find_next_set_bit(node.mask, start) {
+                    let child_idx = node.children[slot];
+                    let count = if depth == NUM_LEVELS - 2 { self.leaf_arena[child_idx as usize].mask.count_ones() as usize }
+                                else { self.arena[child_idx as usize].count as usize };
+                    if k < count {
+                        key |= (slot as u32) << ((NUM_LEVELS - 1 - depth) * BITS_PER_LEVEL);
                         node_idx = child_idx;
-                        continue 'level_loop;
-                    } else {
-                        // The k-th element is not here. Skip this subtree's elements.
-                        k -= child_count;
-                    }
-                    // Continue searching for the next sibling
-                    start_search_idx = child_slot + 1;
-                } else {
-                    // This should be unreachable if k and counts are consistent.
-                    return None;
-                }
+                        break;
+                    } else { k -= count; }
+                    start = slot + 1;
+                } else { return None; }
             }
         }
-        Some(key)
+        let leaf = &self.leaf_arena[node_idx as usize];
+        let mut start = 0;
+        loop {
+            if let Some(slot) = self.find_next_set_bit(leaf.mask, start) {
+                if k == 0 { return Some(key | slot as u32); }
+                k -= 1;
+                start = slot + 1;
+            } else { return None; }
+        }
     }
 
     #[inline(always)]
     fn glass_min(&self) -> Option<(u32, u64)> {
-        if let Some(leaf_idx) = self.min_leaf.get() {
-            if self.min_key.get() != u32::MAX {
-                if let Some(v) = self.arena[leaf_idx].value {
-                    return Some((self.min_key.get(), v));
-                }
-            }
+        let leaf_idx = self.min_leaf.get();
+        if leaf_idx != u32::MAX {
+            let leaf = &self.leaf_arena[leaf_idx as usize];
+            let slot = leaf.mask.trailing_zeros() as usize;
+            return Some(((leaf.ht_k << BITS_PER_LEVEL) | slot as u32, leaf.values[slot]));
         }
-        self.glass_find_extreme(true)
+        None
     }
 
     #[inline(always)]
     fn glass_max(&self) -> Option<(u32, u64)> {
-        if let Some(leaf_idx) = self.max_leaf.get() {
-            if self.max_key.get() != 0 {
-                if let Some(v) = self.arena[leaf_idx].value {
-                    return Some((self.max_key.get(), v));
-                }
-            }
+        let leaf_idx = self.max_leaf.get();
+        if leaf_idx != u32::MAX {
+            let leaf = &self.leaf_arena[leaf_idx as usize];
+            let slot = 63 - leaf.mask.leading_zeros() as usize;
+            return Some(((leaf.ht_k << BITS_PER_LEVEL) | slot as u32, leaf.values[slot]));
         }
-        self.glass_find_extreme(false)
+        None
     }
 
     #[inline(always)]
     fn glass_find_extreme(&self, is_min: bool) -> Option<(u32, u64)> {
-        if self.arena[self.root].mask == 0 {
-            return None;
-        }
-
+        if self.arena[self.root as usize].mask == 0 { return None; }
         let mut node_idx = self.root;
         let mut key = 0u32;
-        for depth in 0..NUM_LEVELS {
-            let mask = self.arena[node_idx].mask;
-            let bits_this_level =
-                BITS_PER_LEVEL.min(KEY_BITS.saturating_sub(depth * BITS_PER_LEVEL));
-            let idx = if is_min {
-                self.find_next_set_bit(mask, 0)?
-            } else {
-                self.find_prev_set_bit(mask, 1 << bits_this_level)?
-            };
-            let shift = KEY_BITS.saturating_sub((depth + 1) * BITS_PER_LEVEL);
-            key |= (idx as u32) << shift;
-            node_idx = self.arena[node_idx].children[idx].unwrap();
+        for depth in 0..NUM_LEVELS - 1 {
+            let node = &self.arena[node_idx as usize];
+            let idx = if is_min { self.find_next_set_bit(node.mask, 0) }
+                      else { self.find_prev_set_bit(node.mask, NUM_CHILDREN) }?;
+            unsafe { (*self.cached_path.get())[depth] = node_idx };
+            key |= (idx as u32) << ((NUM_LEVELS - 1 - depth) * BITS_PER_LEVEL);
+            node_idx = node.children[idx];
         }
-
-        let value = self.arena[node_idx].value;
-        if let Some(v) = value {
-            if is_min {
-                self.min_key.set(key);
-                self.min_leaf.set(Some(node_idx));
-            } else {
-                self.max_key.set(key);
-                self.max_leaf.set(Some(node_idx));
-            }
-            Some((key, v))
-        } else {
-            None
-        }
+        let leaf_idx = node_idx;
+        let leaf = &self.leaf_arena[leaf_idx as usize];
+        let idx = if is_min { self.find_next_set_bit(leaf.mask, 0) }
+                  else { self.find_prev_set_bit(leaf.mask, NUM_CHILDREN) }?;
+        let price = key | idx as u32;
+        self.cached_leaf.set(leaf_idx);
+        self.cached_last_key.set(Some(price));
+        self.cached_d.set(NUM_LEVELS as u32);
+        if is_min { self.min_key.set(price); self.min_leaf.set(leaf_idx); }
+        else { self.max_key.set(price); self.max_leaf.set(leaf_idx); }
+        Some((price, leaf.values[idx]))
     }
 
     #[inline(always)]
     fn find_next_set_bit(&self, mut mask: u64, start: usize) -> Option<usize> {
-        if start >= NUM_CHILDREN {
-            return None;
-        }
+        if start >= NUM_CHILDREN { return None; }
         mask >>= start;
-        if mask == 0 {
-            return None;
-        }
-        let pos = if self.has_bmi1 {
-            unsafe { _tzcnt_u64(mask) as usize }
-        } else {
-            mask.trailing_zeros() as usize
-        };
+        if mask == 0 { return None; }
+        let pos = if self.has_bmi1 { unsafe { _tzcnt_u64(mask) as usize } }
+                  else { mask.trailing_zeros() as usize };
         Some(start + pos)
     }
 
     #[inline(always)]
     fn find_prev_set_bit(&self, mut mask: u64, end: usize) -> Option<usize> {
-        if end == 0 {
-            return None;
-        }
-        if self.has_bmi2 {
-            unsafe {
-                mask = _bzhi_u64(mask, end as u32);
-            }
-        } else if end < 64 {
-            mask &= (1u64 << end) - 1;
-        }
-        if mask == 0 {
-            return None;
-        }
-        let pos = if self.has_lzcnt {
-            unsafe { (63 - _lzcnt_u64(mask)) as usize }
-        } else {
-            63 - mask.leading_zeros() as usize
-        };
+        if end == 0 { return None; }
+        if self.has_bmi2 { unsafe { mask = _bzhi_u64(mask, end as u32); } }
+        else if end < 64 { mask &= (1u64 << end) - 1; }
+        if mask == 0 { return None; }
+        let pos = if self.has_lzcnt { unsafe { (63 - _lzcnt_u64(mask)) as usize } }
+                  else { 63 - mask.leading_zeros() as usize };
         Some(pos)
     }
 }
 
-#[allow(dead_code)]
-struct StackItem {
-    node_idx: usize,
-    depth: u32,
-    key: u32,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_new() {
-        let glass = Glass::new();
-        assert_eq!(glass.glass_size(), 0);
-        assert_eq!(glass.arena.len(), 1);
-        assert_eq!(glass.root, 0);
-        assert!(unsafe { &*glass.cache.get() }.is_empty());
-        assert!(unsafe { &*glass.preempt.get() }.is_empty());
-    }
-
-    #[test]
-    fn test_insert_and_get() {
-        let mut glass = Glass::new();
-        glass.insert(123, 999999999999);
-        assert_eq!(glass.get(123), Some(999999999999));
-        assert_eq!(glass.glass_size(), 1);
-        glass.insert(456, 888888888888);
-        assert_eq!(glass.get(456), Some(888888888888));
-        assert_eq!(glass.glass_size(), 2);
-        // Insert zero value removes
-        glass.insert(123, 0);
-        assert_eq!(glass.get(123), None);
-        assert_eq!(glass.glass_size(), 1);
-    }
-
-    #[test]
-    fn test_remove_by_index() {
-        let mut glass = Glass::new();
-        glass.insert(10, 100);
-        glass.insert(30, 300);
-        glass.insert(20, 200);
-        glass.insert(5, 50);
-
-        // Current sorted keys: 5, 10, 20, 30
-        assert_eq!(glass.glass_size(), 4);
-        assert_eq!(glass.min(), Some((5, 50)));
-
-        // Remove the 2nd smallest element (index 1), which is key 10
-        assert_eq!(glass.remove_by_index(1), Some((10, 100)));
-        assert_eq!(glass.glass_size(), 3);
-        assert_eq!(glass.get(10), None);
-
-        // Current sorted keys: 5, 20, 30
-        // Remove the smallest (index 0), which is key 5
-        assert_eq!(glass.remove_by_index(0), Some((5, 50)));
-        assert_eq!(glass.glass_size(), 2);
-        assert_eq!(glass.get(5), None);
-        assert_eq!(glass.min(), Some((20, 200)));
-
-        // Current sorted keys: 20, 30
-        // Remove the largest (index 1), which is key 30
-        assert_eq!(glass.remove_by_index(1), Some((30, 300)));
-        assert_eq!(glass.glass_size(), 1);
-        assert_eq!(glass.get(30), None);
-        assert_eq!(glass.max(), Some((20, 200)));
-
-        // Remove last element
-        assert_eq!(glass.remove_by_index(0), Some((20, 200)));
-        assert_eq!(glass.glass_size(), 0);
-        assert!(glass.min().is_none());
-
-        // Try to remove from empty trie
-        assert_eq!(glass.remove_by_index(0), None);
-    }
-
-    #[test]
-    fn test_update_value() {
-        let mut glass = Glass::new();
-        glass.insert(123, 100);
-        let updated = glass.update_value(123, |v| *v += 50);
-        assert!(updated);
-        assert_eq!(glass.get(123), Some(150));
-        let not_updated = glass.update_value(999, |_| {});
-        assert!(!not_updated);
-    }
-
-    #[test]
-    fn test_remove() {
-        let mut glass = Glass::new();
-        glass.insert(123, 999999999999);
-        let removed = glass.remove(123);
-        assert_eq!(removed, Some(999999999999));
-        assert_eq!(glass.get(123), None);
-        assert_eq!(glass.glass_size(), 0);
-        let none_removed = glass.remove(123);
-        assert_eq!(none_removed, None);
-    }
-
-    #[test]
-    fn test_min_and_max() {
-        let mut glass = Glass::new();
-        glass.insert(10, 500);
-        glass.insert(20, 600);
-        glass.insert(30, 700);
-        glass.insert(40, 800);
-        assert_eq!(glass.min(), Some((10, 500)));
-        assert_eq!(glass.max(), Some((40, 800)));
-        glass.remove(10);
-        assert_eq!(glass.min(), Some((20, 600)));
-        glass.remove(40);
-        assert_eq!(glass.max(), Some((30, 700)));
-    }
-
-    #[test]
-    fn test_restructure() {
-        let mut glass = Glass::new();
-        // Fill beyond MAX_SIZE to trigger preempt
-        for i in 0..(MAX_SIZE + 10) {
-            glass.insert(i as u32, 1);
-        }
-        assert_eq!(glass.glass_size(), MAX_SIZE);
-        assert!(!unsafe { &*glass.preempt.get() }.is_empty());
-        // Restructure should move some from preempt to trie
-        glass.remove(0); // Make space in the trie
-        assert_eq!(glass.glass_size(), MAX_SIZE - 1);
-        let preempt_size_before = unsafe { &*glass.preempt.get() }.len();
-        glass.restructure(); // Should pull one item from preempt
-        assert_eq!(glass.glass_size(), MAX_SIZE);
-        let preempt_size_after = unsafe { &*glass.preempt.get() }.len();
-        assert_eq!(preempt_size_after, preempt_size_before - 1);
-    }
-
-    #[test]
-    fn test_buy_shares() {
-        let mut glass = Glass::new();
-        glass.insert(10, 500);
-        glass.insert(20, 600);
-        let cost = glass.buy_shares(700);
-        assert_eq!(cost, (10 * 500) + (20 * 200));
-        assert_eq!(glass.get(10), None); // Removed since 0
-        assert_eq!(glass.get(20), Some(400));
-    }
-
-    #[test]
-    fn test_compute_buy_cost() {
-        let mut glass = Glass::new();
-        glass.insert(10, 500);
-        glass.insert(20, 600);
-        glass.insert(30, 700);
-        glass.insert(40, 800);
-        let cost = glass.compute_buy_cost(1000);
-        assert_eq!(cost, (10 * 500) + (20 * 500)); // Partial
-        let full_cost = glass.compute_buy_cost(2600);
-        assert_eq!(full_cost, (10 * 500) + (20 * 600) + (30 * 700) + (40 * 800));
-    }
-
-    #[test]
-    fn test_glass_insert() {
-        let mut glass = Glass::new();
-        glass.glass_insert(123, 999);
-        assert_eq!(glass.glass_get(123), Some(999));
-        assert_eq!(glass.min_key.get(), 123);
-        assert_eq!(glass.max_key.get(), 123);
-    }
-
-    #[test]
-    fn test_glass_get() {
-        let mut glass = Glass::new();
-        glass.glass_insert(123, 999);
-        assert_eq!(glass.glass_get(123), Some(999));
-        assert_eq!(glass.glass_get(456), None);
-    }
-
-    #[test]
-    fn test_glass_get_mut() {
-        let mut glass = Glass::new();
-        glass.glass_insert(123, 999);
-        if let Some(v) = glass.glass_get_mut(123) {
-            *v = 1000;
-        }
-        assert_eq!(glass.glass_get(123), Some(1000));
-        assert!(glass.glass_get_mut(456).is_none());
-    }
-
-    #[test]
-    fn test_glass_remove() {
-        let mut glass = Glass::new();
-        glass.glass_insert(123, 999);
-        assert_eq!(glass.glass_size(), 1);
-        let removed = glass.glass_remove(123);
-        assert_eq!(removed, Some(999));
-        assert_eq!(glass.glass_size(), 0);
-        assert_eq!(glass.glass_get(123), None);
-        assert_eq!(glass.min_key.get(), 4294967295);
-        assert_eq!(glass.max_key.get(), 0);
-    }
-
-    #[test]
-    fn test_glass_min() {
-        let mut glass = Glass::new();
-        glass.glass_insert(20, 600);
-        glass.glass_insert(10, 500);
-        assert_eq!(glass.glass_min(), Some((10, 500)));
-    }
-
-    #[test]
-    fn test_glass_max() {
-        let mut glass = Glass::new();
-        glass.glass_insert(20, 600);
-        glass.glass_insert(30, 700);
-        assert_eq!(glass.glass_max(), Some((30, 700)));
-    }
-
-    #[test]
-    fn test_glass_find_extreme() {
-        let mut glass = Glass::new();
-        glass.glass_insert(10, 500);
-        glass.glass_insert(40, 800);
-        assert_eq!(glass.glass_find_extreme(true), Some((10, 500)));
-        assert_eq!(glass.glass_find_extreme(false), Some((40, 800)));
-    }
-
-    #[test]
-    fn test_glass_compute_buy_cost() {
-        let mut glass = Glass::new();
-        glass.glass_insert(10, 500);
-        glass.glass_insert(20, 600);
-        let mut target = 700u64;
-        let mut cost = 0u64;
-        glass.glass_compute_buy_cost(&mut target, &mut cost);
-        assert_eq!(cost, (10 * 500) + (20 * 200));
-        assert_eq!(target, 0);
-    }
-
-    #[test]
-    fn test_find_next_set_bit() {
-        let glass = Glass::new();
-        let mask = 0b0001_0010; // Bits 1 and 4 set
-        assert_eq!(glass.find_next_set_bit(mask, 0), Some(1));
-        assert_eq!(glass.find_next_set_bit(mask, 2), Some(4));
-        assert_eq!(glass.find_next_set_bit(mask, 5), None);
-    }
-
-    #[test]
-    fn test_find_prev_set_bit() {
-        let glass = Glass::new();
-        let mask = 0b0001_0010; // Bits 1 and 4 set
-        assert_eq!(glass.find_prev_set_bit(mask, 64), Some(4));
-        assert_eq!(glass.find_prev_set_bit(mask, 4), Some(1));
-        assert_eq!(glass.find_prev_set_bit(mask, 1), None);
-    }
-}
+include!("tests.rs");

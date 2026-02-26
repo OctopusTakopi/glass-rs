@@ -166,10 +166,45 @@ fn bench_compute_buy_cost(c: &mut Criterion) {
     for i in 0..N {
         map.insert(keys[i], values[i]);
     }
-    let target = 1000u64;
 
     c.bench_function("compute_buy_cost_btree", |b| {
         b.iter(|| black_box(compute_buy_cost_btree(&map, black_box(target))))
+    });
+}
+
+fn bench_buy_shares(c: &mut Criterion) {
+    let keys = generate_random_keys(N);
+    let values = generate_random_values(N);
+    let target = 1000u64;
+
+    c.bench_function("buy_shares", |b| {
+        b.iter_with_setup(
+            || {
+                let mut glass = Glass::new();
+                for i in 0..N {
+                    glass.insert(keys[i], values[i]);
+                }
+                glass
+            },
+            |mut glass| {
+                black_box(glass.buy_shares(black_box(target)));
+            },
+        )
+    });
+
+    c.bench_function("buy_shares_btree", |b| {
+        b.iter_with_setup(
+            || {
+                let mut map = BTreeMap::new();
+                for i in 0..N {
+                    map.insert(keys[i], values[i]);
+                }
+                map
+            },
+            |mut map| {
+                black_box(buy_shares_btree(&mut map, black_box(target)));
+            },
+        )
     });
 }
 
@@ -235,7 +270,6 @@ fn bench_remove_by_index(c: &mut Criterion) {
                 for i in 0..N {
                     glass.insert(keys[i], values[i]);
                 }
-                // FIX: Get the size *before* moving the glass.
                 let size = glass.glass_size();
                 (glass, size, rng())
             },
@@ -273,6 +307,31 @@ fn compute_buy_cost_btree(map: &BTreeMap<u32, u64>, target: u64) -> u64 {
         remaining -= take;
     }
     cost
+}
+
+fn buy_shares_btree(map: &mut BTreeMap<u32, u64>, mut shares_to_buy: u64) -> u64 {
+    let mut total_cost = 0u64;
+    while shares_to_buy > 0 {
+        let entry = if let Some(entry) = map.first_entry() {
+            entry
+        } else {
+            break;
+        };
+
+        let price = *entry.key();
+        let avail = *entry.get();
+
+        if avail <= shares_to_buy {
+            total_cost += (price as u64) * avail;
+            shares_to_buy -= avail;
+            entry.remove();
+        } else {
+            total_cost += (price as u64) * shares_to_buy;
+            *map.get_mut(&price).unwrap() -= shares_to_buy;
+            shares_to_buy = 0;
+        }
+    }
+    total_cost
 }
 
 fn remove_by_index_btree(map: &mut BTreeMap<u32, u64>, index: usize) -> Option<(u32, u64)> {
@@ -370,7 +429,7 @@ criterion_group! {
     name = benches;
     config = Criterion::default().measurement_time(Duration::from_secs(6));
     targets = bench_insert, bench_get, bench_remove, bench_min_max, bench_compute_buy_cost,
-        bench_remove_by_index, bench_remove_by_index_btree
+        bench_buy_shares, bench_remove_by_index, bench_remove_by_index_btree
 }
 
 criterion_main!(benches);
