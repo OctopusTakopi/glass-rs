@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `top_levels(n, &mut buf)`: allocation-free best-N snapshot for imbalance
+  computation; ~1.5x faster than `BTreeMap` at depth 25, with AVX-512
+  `vpcompressq` whole-leaf extraction (occupancy bitmap as lane mask) for
+  bulk depths.
 - PDEP-based O(1) k-th set-bit select in the rank/select descent
   (`remove_by_index`): ~17-20% faster random-index drains, runtime-gated on
   BMI2 (portable loop fallback elsewhere).

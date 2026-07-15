@@ -43,5 +43,10 @@ fn main() {
     let proceeds = book.sell_shares(100);
     println!("sold 100 shares for {proceeds}");
 
+    // Top-of-book snapshot into a reused buffer (imbalance-style access).
+    let mut top = Vec::with_capacity(25);
+    book.top_levels(25, &mut top);
+    println!("top levels: {top:?}");
+
     println!("remaining: {:?}", book.iter().collect::<Vec<_>>());
 }

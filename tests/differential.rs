@@ -388,6 +388,52 @@ fn btreemap_like_api() {
     );
 }
 
+/// top_levels must agree with the oracle prefix through the dense (AVX
+/// compress) path, the sparse (scalar) path, and the overflow-tier spill.
+#[test]
+fn top_levels_snapshot() {
+    let mut buf = Vec::new();
+
+    // Dense leaves: contiguous keys fill 64-slot leaves completely.
+    let mut glass = Glass::new();
+    let mut oracle = BTreeMap::new();
+    for i in 0..300u32 {
+        glass.insert(1000 + i, i as u64 + 1);
+        oracle.insert(1000 + i, i as u64 + 1);
+    }
+    for depth in [1usize, 8, 25, 64, 100, 300, 500] {
+        glass.top_levels(depth, &mut buf);
+        let expected: Vec<(u32, u64)> = oracle.iter().take(depth).map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(buf, expected, "dense top_levels({depth})");
+    }
+
+    // Sparse leaves: strided keys, few bits per leaf.
+    let mut glass = Glass::new();
+    let mut oracle = BTreeMap::new();
+    for i in 0..200u32 {
+        glass.insert(i * 97, i as u64 + 1);
+        oracle.insert(i * 97, i as u64 + 1);
+    }
+    for depth in [1usize, 25, 200] {
+        glass.top_levels(depth, &mut buf);
+        let expected: Vec<(u32, u64)> = oracle.iter().take(depth).map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(buf, expected, "sparse top_levels({depth})");
+    }
+
+    // Spill into the overflow tier: n beyond the 4096-level trie.
+    let mut glass = Glass::new();
+    let mut oracle = BTreeMap::new();
+    for i in 0..5000u32 {
+        glass.insert(i, 1);
+        oracle.insert(i, 1);
+    }
+    glass.top_levels(4500, &mut buf);
+    let expected: Vec<(u32, u64)> = oracle.iter().take(4500).map(|(&k, &v)| (k, v)).collect();
+    assert_eq!(buf, expected, "spill top_levels(4500)");
+    assert_eq!(glass.top_levels(0, &mut buf), 0);
+    assert!(buf.is_empty());
+}
+
 /// FromIterator/Extend round-trip through iter().
 #[test]
 fn from_iterator_round_trip() {
@@ -537,6 +583,12 @@ fn random_ops_match_btreemap() {
                     oracle.contains_key(&key),
                     "contains_key({key}) at step {step}"
                 );
+                let depth = (rng.below(60) + 1) as usize;
+                let mut buf = Vec::new();
+                glass.top_levels(depth, &mut buf);
+                let expected: Vec<(u32, u64)> =
+                    oracle.iter().take(depth).map(|(&k, &v)| (k, v)).collect();
+                assert_eq!(buf, expected, "top_levels({depth}) at step {step}");
             }
         }
     }

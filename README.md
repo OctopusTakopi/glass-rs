@@ -122,6 +122,11 @@ Order-book operations beyond the map API:
 - `next_level` / `prev_level` — successor/predecessor level (the paper's
   `next`/`prev`), O(1) via the linked leaf list when the neighbor shares a
   leaf.
+- `top_levels(n, &mut buf)` — snapshot of the best `n` levels into a
+  caller-owned buffer (allocation-free steady state); the imbalance-
+  computation access pattern. Dense leaves that are consumed whole extract
+  via AVX-512 `vpcompressq`, using the occupancy bitmap directly as the lane
+  mask.
 - `remove_by_index` — k-th smallest level, via per-subtree counts.
 
 Note for deep bid books (> 4096 levels): the preemption tier keeps the
@@ -185,27 +190,30 @@ of ~1,500 price levels with sequential/local keys; nanoseconds per operation.
 Absolute numbers vary with machine load — the glass/BTreeMap ratio within a
 run is the stable signal.
 
-| Operation                        | Glass (ns/op) | BTreeMap (ns/op) | Speedup   |
-|----------------------------------|---------------|------------------|-----------|
-| Insert                           | 4.24          | 51.48            | 12.1x     |
-| Get (existing)                   | 2.43          | 47.19            | 19.4x     |
-| Get (non-existing)               | 2.51          | 47.96            | 19.1x     |
-| Remove (incl. insert)*           | 5.13          | 52.65            | 10.3x     |
-| Min                              | 2.97          | 2.76             | ~parity   |
-| Max                              | 3.79          | 3.22             | ~parity   |
-| Compute Buy Cost (1k shares)     | 11.10         | 8.18             | 0.7x      |
-| **Buy Shares (1k shares)**       | **773**       | **9,971**        | **12.9x** |
-| **Compute Buy Cost (500k, deep)**| **297**       | **2,066**        | **7.0x**  |
-| **Buy Shares (500k, deep)**      | **2,495**     | **31,558**       | **12.6x** |
-| Compute Sell Cost (1k shares)    | 8.67          | 9.52             | 1.1x      |
-| **Sell Shares (1k shares)**      | **595**       | **9,568**        | **16.1x** |
-| Compute Sell Cost (500k, deep)   | 290           | 2,087            | 7.2x      |
-| **Sell Shares (500k, deep)**     | **2,642**     | **60,611**       | **22.9x** |
+All rows below come from a single run pinned to an idle core (`taskset`,
+HT sibling also idle), built with the JCC mitigation flag (see below) —
+which also speeds up the BTreeMap baseline, so these ratios are honest.
+
+| Operation                         | Glass (ns/op) | BTreeMap (ns/op) | Speedup   |
+|-----------------------------------|---------------|------------------|-----------|
+| Insert                            | 4.09          | 50.41            | 12.3x     |
+| Get (existing)                    | 2.40          | 43.83            | 18.3x     |
+| Get (non-existing)                | 2.36          | 43.85            | 18.6x     |
+| Remove (incl. insert)*            | 5.02          | 51.07            | 10.2x     |
+| Min                               | 2.88          | 2.48             | 0.9x      |
+| Max                               | 3.68          | 3.16             | 0.9x      |
+| **Top 25 Levels (snapshot)**      | **29.8**      | **46.5**         | **1.6x**  |
+| Compute Buy Cost (1k shares)      | 8.16          | 6.30             | 0.8x      |
+| Compute Sell Cost (1k shares)     | 10.34         | 10.55            | ~parity   |
+| **Buy Shares (1k shares)**        | **577**       | **9,382**        | **16.3x** |
+| **Sell Shares (1k shares)**       | **703**       | **9,606**        | **13.7x** |
+| Compute Buy Cost (500k, deep)     | 358           | 2,006            | 5.6x      |
+| Compute Sell Cost (500k, deep)    | 334           | 2,037            | 6.1x      |
+| **Buy Shares (500k, deep)**       | **2,519**     | **31,063**       | **12.3x** |
+| **Sell Shares (500k, deep)**      | **2,519**     | **59,868**       | **23.8x** |
 
 \* The remove benchmark re-inserts 1M keys per iteration; remove alone is
-≈0.9 ns/op after subtracting the insert cost. All rows built with the JCC
-mitigation flag (see below), which also speeds up the BTreeMap baseline —
-these ratios are honest.
+≈0.9 ns/op after subtracting the insert cost.
 
 The *deep sweep* benchmarks execute/estimate a 500,000-share order spanning
 ~24 leaves (≈1,500 price levels), which is where whole-leaf vectorized

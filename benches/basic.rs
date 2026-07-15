@@ -293,6 +293,37 @@ fn bench_sell(c: &mut Criterion) {
     });
 }
 
+/// Top-of-book snapshot: the imbalance-computation access pattern.
+fn bench_top_levels(c: &mut Criterion) {
+    let keys = generate_random_keys(N);
+    let values = generate_random_values(N);
+
+    let mut glass = Glass::new();
+    for i in 0..N {
+        glass.insert(keys[i], values[i]);
+    }
+    let mut buf: Vec<(u32, u64)> = Vec::with_capacity(64);
+    c.bench_function("top_levels_25", |b| {
+        b.iter(|| {
+            glass.top_levels(black_box(25), &mut buf);
+            black_box(&buf);
+        })
+    });
+
+    let mut map = BTreeMap::new();
+    for i in 0..N {
+        map.insert(keys[i], values[i]);
+    }
+    let mut buf: Vec<(u32, u64)> = Vec::with_capacity(64);
+    c.bench_function("top_levels_25_btree", |b| {
+        b.iter(|| {
+            buf.clear();
+            buf.extend(map.iter().take(black_box(25)).map(|(&k, &v)| (k, v)));
+            black_box(&buf);
+        })
+    });
+}
+
 /// Deep sweeps spanning many leaves: exercises whole-leaf (vectorized)
 /// consumption instead of the first-leaf partial path.
 fn bench_deep_sweep(c: &mut Criterion) {
@@ -604,8 +635,8 @@ criterion_group! {
     name = benches;
     config = Criterion::default().measurement_time(Duration::from_secs(6));
     targets = bench_insert, bench_get, bench_remove, bench_min_max, bench_compute_buy_cost,
-        bench_buy_shares, bench_sell, bench_deep_sweep, bench_remove_by_index,
-        bench_remove_by_index_btree
+        bench_buy_shares, bench_sell, bench_top_levels, bench_deep_sweep,
+        bench_remove_by_index, bench_remove_by_index_btree
 }
 
 criterion_main!(benches);

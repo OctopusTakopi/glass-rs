@@ -457,6 +457,69 @@ impl Glass {
         }
     }
 
+    /// Copies the best (lowest-price) `n` levels into `out` in ascending
+    /// order, clearing it first; returns the number written (fewer than `n`
+    /// only if the book has fewer levels).
+    ///
+    /// Designed for top-of-book snapshots — e.g. computing order-book
+    /// imbalance over the best N levels each tick. Reuses `out`'s capacity,
+    /// so a caller-held buffer makes the steady state allocation-free.
+    ///
+    /// Where AVX-512 is available, dense leaves are extracted with masked
+    /// compress-stores (`vpcompressq`), using the leaf occupancy bitmap
+    /// directly as the lane mask; sparse leaves use a scalar bit-scan.
+    pub fn top_levels(&self, n: usize, out: &mut Vec<(u32, u64)>) -> usize {
+        out.clear();
+        if n == 0 {
+            return 0;
+        }
+        out.reserve(n);
+
+        let mut curr = self.min_leaf.get();
+        while curr != u32::MAX && out.len() < n {
+            let leaf = &self.leaf_arena[curr as usize];
+            self.prefetch_leaf(leaf.next_leaf);
+            let base = leaf.ht_k << BITS_PER_LEVEL;
+
+            // Vectorized extraction only when the WHOLE leaf is consumed:
+            // vpcompressq extracts all 64 slots regardless, so a partial
+            // take (typical small n) is cheaper via the scalar scan.
+            #[cfg(all(target_arch = "x86_64", not(miri)))]
+            {
+                let count = self.popcnt64(leaf.mask) as usize;
+                if self.has_avx512 && count >= 16 && n - out.len() >= count {
+                    unsafe { extract_leaf_avx512(leaf, base, count, out) };
+                    curr = leaf.next_leaf;
+                    continue;
+                }
+            }
+
+            // Plain ops: bsf/blsr-equivalents need no dispatch on the scan
+            // chain, and flag branches inside this loop measurably cost.
+            let mut mask = leaf.mask;
+            while mask != 0 && out.len() < n {
+                let slot = mask.trailing_zeros() as usize;
+                out.push((base | slot as u32, leaf.values[slot]));
+                mask &= mask - 1;
+            }
+            curr = leaf.next_leaf;
+        }
+
+        // Overflow tier tail (only when n exceeds the trie's levels).
+        if out.len() < n && !unsafe { (*self.preempt.get()).is_empty() } {
+            self.ensure_sorted_preempt_keys();
+            let keys = unsafe { &*self.sorted_preempt_keys.get() };
+            let preempt = unsafe { &*self.preempt.get() };
+            for &k in keys {
+                if out.len() >= n {
+                    break;
+                }
+                out.push((k, *preempt.get(&k).unwrap()));
+            }
+        }
+        out.len()
+    }
+
     /// Returns `true` if `key` holds a level.
     pub fn contains_key(&self, key: u32) -> bool {
         self.get(key).is_some()
@@ -1934,6 +1997,35 @@ fn leaf_sums_scalar(values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
         weighted = weighted.wrapping_add((i as u64).wrapping_mul(v));
     }
     (qty, weighted)
+}
+
+// Dense-leaf extraction: for each 8-slot chunk, the corresponding byte of
+// the occupancy bitmap is the k-mask, and vpcompressq packs the live values
+// (and their slot indices) densely — no per-bit scanning. Slots and values
+// land in stack scratch, then the requested prefix is pushed as tuples.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[target_feature(enable = "avx512f,avx512dq")]
+fn extract_leaf_avx512(leaf: &LeafNode, base: u32, need: usize, out: &mut Vec<(u32, u64)>) {
+    unsafe {
+        let mut slots = [0u64; NUM_CHILDREN];
+        let mut vals = [0u64; NUM_CHILDREN];
+        let mut cnt = 0usize;
+        let mut idx = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
+        let eight = _mm512_set1_epi64(8);
+        for chunk in 0..NUM_CHILDREN / 8 {
+            let m8 = ((leaf.mask >> (chunk * 8)) & 0xFF) as u8;
+            if m8 != 0 {
+                let v = _mm512_loadu_si512(leaf.values.as_ptr().add(chunk * 8) as *const _);
+                _mm512_mask_compressstoreu_epi64(vals.as_mut_ptr().add(cnt) as *mut _, m8, v);
+                _mm512_mask_compressstoreu_epi64(slots.as_mut_ptr().add(cnt) as *mut _, m8, idx);
+                cnt += m8.count_ones() as usize;
+            }
+            idx = _mm512_add_epi64(idx, eight);
+        }
+        for i in 0..need.min(cnt) {
+            out.push((base | slots[i] as u32, vals[i]));
+        }
+    }
 }
 
 // 8 x 512-bit lanes; vpmullq needs AVX-512DQ (Skylake-SP/Cascade Lake+).
