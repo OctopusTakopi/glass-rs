@@ -16,8 +16,8 @@ exclude = [".idea/", ".github/"]
 ahash = "0.8"
 
 [dev-dependencies]
-criterion = "0.6"
-rand = "0.9"
+criterion = "0.8"
+rand = "0.10"
 
 [[bench]]
 name = "basic"
