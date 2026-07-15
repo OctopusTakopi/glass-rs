@@ -72,7 +72,7 @@ These accelerate lookups and must all be kept consistent on mutation:
 
 ### Portability and dispatch conventions
 
-All x86 intrinsics are cfg-gated (`target_arch = "x86_64"`, and `not(miri)` for prefetch/SIMD); the crate must keep compiling on aarch64 (CI checks it). Bit scans go through the runtime-dispatched helpers `tz64` / `clear_lowest_bit` / `high_bit` / `popcnt64` — note that plain `count_ones()` compiles to a software fallback on baseline x86-64, so `popcnt64` matters on counting paths. Hot public methods are `#[inline(always)]`, but rare paths are deliberately outlined (`#[cold]`/`#[inline(never)]`: `trie_find_leaf`, `remove_zeroed_glass_value`, `insert_new_glass_key`) to keep hot bodies small and layout-stable — keep new rare paths out of line too.
+All x86 intrinsics are cfg-gated (`target_arch = "x86_64"`, and `not(miri)` for prefetch/SIMD); the crate must keep compiling on aarch64 (CI checks it). Bit scans go through the runtime-dispatched helpers `tz64` / `clear_lowest_bit` / `high_bit` / `popcnt64` / `select_kth_set_bit` (PDEP) — note that plain `count_ones()` compiles to a software fallback on baseline x86-64, so `popcnt64` matters on counting paths, and PDEP select turns the k-th-bit scan in `glass_find_kth_key` into two instructions. Hot public methods are `#[inline(always)]`, but rare paths are deliberately outlined (`#[cold]`/`#[inline(never)]`: `trie_find_leaf`, `remove_zeroed_glass_value`, `insert_new_glass_key`) to keep hot bodies small and layout-stable — keep new rare paths out of line too.
 
 ### Interior mutability and threading
 

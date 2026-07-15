@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- PDEP-based O(1) k-th set-bit select in the rank/select descent
+  (`remove_by_index`): ~17-20% faster random-index drains, runtime-gated on
+  BMI2 (portable loop fallback elsewhere).
+
 - **Sell side**: `sell_shares` and `compute_sell_cost` — market-sell
   execution/estimation from the highest price downward (bid-book mirror of
   the buy path), with whole-leaf vectorized consumption and overflow-tier

@@ -1752,17 +1752,27 @@ impl Glass {
             }
         }
         let leaf = &self.leaf_arena[node_idx as usize];
-        let mut start = 0;
-        loop {
-            {
-                let slot = self.find_next_set_bit(leaf.mask, start)?;
-                if k == 0 {
-                    return Some(key | slot as u32);
-                }
-                k -= 1;
-                start = slot + 1;
-            }
+        // The descent guarantees k < popcount(leaf.mask).
+        Some(key | self.select_kth_set_bit(leaf.mask, k as u32) as u32)
+    }
+
+    // Index of the k-th (0-based) set bit of `mask`; requires
+    // k < popcount(mask). PDEP deposits a unit bit into the k-th set
+    // position, turning an up-to-64-iteration scan into two instructions.
+    // Runtime-gated on BMI2: PDEP is 3 cycles on Intel and Zen 3+, but
+    // microcoded (hundreds of cycles) on older AMD, where the fallback loop
+    // is preferable anyway.
+    #[inline(always)]
+    fn select_kth_set_bit(&self, mask: u64, k: u32) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        if self.has_bmi2 {
+            return unsafe { _tzcnt_u64(_pdep_u64(1u64 << k, mask)) as usize };
         }
+        let mut m = mask;
+        for _ in 0..k {
+            m &= m.wrapping_sub(1);
+        }
+        m.trailing_zeros() as usize
     }
 
     #[inline(always)]
