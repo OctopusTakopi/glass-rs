@@ -12,6 +12,12 @@ const ARENA_CAPACITY: usize = 16384;
 const LEAF_ARENA_CAPACITY: usize = 4096;
 const HT_MAX_LOOKUP_LEN: usize = 5;
 
+// Tri-state answers of the bounded hash-table probe (paper §5.2), encoded as
+// sentinels so the hot path stays a plain u32 compare. Arena indices can
+// never reach these values (capacity is far below u32::MAX - 1).
+const HT_ABSENT: u32 = u32::MAX;
+const HT_UNKNOWN: u32 = u32::MAX - 1;
+
 struct InternalNode {
     mask: u64,
     count: u32,
@@ -75,6 +81,7 @@ pub struct Glass {
     has_bmi2: bool,
     has_bmi1: bool,
     has_lzcnt: bool,
+    has_avx512: bool,
     _padding_flags: [u8; 3],
 
     // === Data structures ===
@@ -119,6 +126,8 @@ impl Glass {
             has_bmi2: std::is_x86_feature_detected!("bmi2"),
             has_bmi1: std::is_x86_feature_detected!("bmi1"),
             has_lzcnt: std::is_x86_feature_detected!("lzcnt"),
+            has_avx512: std::is_x86_feature_detected!("avx512f")
+                && std::is_x86_feature_detected!("avx512dq"),
             ht_heads: UnsafeCell::new(ht_heads),
             preempt: UnsafeCell::new(HashMap::new()),
             cached_path: UnsafeCell::new([0; 5]),
@@ -149,8 +158,12 @@ impl Glass {
         }
     }
 
+    // Paper §5.2: a bounded chain probe has three possible answers. "Absent"
+    // is authoritative (every live leaf is chained), but "Unknown" (chain
+    // longer than HT_MAX_LOOKUP_LEN without a match) requires falling back to
+    // a full trie descent.
     #[inline(always)]
-    fn ht_lookup(&self, partial_key: u32) -> Option<u32> {
+    fn ht_lookup(&self, partial_key: u32) -> u32 {
         let h = (partial_key as usize) & (HT_SIZE - 1);
         let heads = unsafe { &*self.ht_heads.get() };
         let mut curr = heads[h];
@@ -158,12 +171,42 @@ impl Glass {
         while curr != u32::MAX && lookups < HT_MAX_LOOKUP_LEN {
             let leaf = &self.leaf_arena[curr as usize];
             if leaf.ht_k == partial_key {
-                return Some(curr);
+                return curr;
             }
             curr = leaf.ht_next;
             lookups += 1;
         }
-        None
+        if curr == u32::MAX { HT_ABSENT } else { HT_UNKNOWN }
+    }
+
+    // Cold fallback for HtAnswer::Unknown — keep it out of line so the hot
+    // lookup sites stay small.
+    #[cold]
+    #[inline(never)]
+    fn trie_find_leaf(&self, partial: u32) -> Option<u32> {
+        let mut node_idx = self.root;
+        for l in 0..NUM_LEVELS - 1 {
+            let shift = (NUM_LEVELS - 2 - l) * BITS_PER_LEVEL;
+            let slot = ((partial >> shift) & 0x3F) as usize;
+            let child = self.arena[node_idx as usize].children[slot];
+            if child == u32::MAX {
+                return None;
+            }
+            node_idx = child;
+        }
+        Some(node_idx)
+    }
+
+    #[inline(always)]
+    fn find_leaf(&self, partial: u32) -> Option<u32> {
+        let r = self.ht_lookup(partial);
+        if r < HT_UNKNOWN {
+            Some(r)
+        } else if r == HT_ABSENT {
+            None
+        } else {
+            self.trie_find_leaf(partial)
+        }
     }
 
     #[inline(always)]
@@ -206,49 +249,81 @@ impl Glass {
         }
     }
 
+    // Insert into the preempt tier, maintaining thres/preempt_min/preempt_max
+    // eagerly (paper §4.5 assigns the threshold on every preemption). If the
+    // bounds are currently invalid they stay invalid and are recomputed lazily.
+    #[inline(always)]
+    fn preempt_insert(&mut self, key: u32, value: u64) {
+        unsafe {
+            (*self.preempt.get()).insert(key, value);
+        }
+        self.preempt_dirty.set(true);
+        if self.preempt_bounds_valid.get() {
+            if key < self.preempt_min.get() {
+                self.preempt_min.set(key);
+                self.thres.set(key);
+            }
+            if key > self.preempt_max.get() {
+                self.preempt_max.set(key);
+            }
+        }
+    }
+
+    // Remove from the preempt tier. Bounds stay valid unless a boundary key
+    // was removed (then they are recomputed lazily on the next routing check).
+    #[inline(always)]
+    fn preempt_remove(&mut self, key: u32) -> Option<u64> {
+        let preempt = unsafe { &mut *self.preempt.get() };
+        let res = preempt.remove(&key);
+        if res.is_some() {
+            if preempt.is_empty() {
+                self.thres.set(u32::MAX);
+                self.preempt_min.set(u32::MAX);
+                self.preempt_max.set(0);
+                self.preempt_bounds_valid.set(true);
+                self.preempt_dirty.set(false);
+                unsafe { (*self.sorted_preempt_keys.get()).clear() };
+            } else {
+                self.preempt_dirty.set(true);
+                if self.preempt_bounds_valid.get()
+                    && (key == self.preempt_min.get() || key == self.preempt_max.get())
+                {
+                    self.preempt_bounds_valid.set(false);
+                }
+            }
+        }
+        res
+    }
+
     #[inline(always)]
     pub fn insert(&mut self, key: u32, value: u64) {
         if value == 0 {
             self.remove(key);
             return;
         }
-        if self.update_value(key, |v| *v = value) {
-            return;
-        }
 
         if self.check_bounds_and_thres(key) {
+            // Overwrite in place if the key is already present (routing and
+            // leaf lookup happen exactly once on this hot path).
+            if let Some(v) = self.glass_get_mut(key) {
+                *v = value;
+                return;
+            }
             if self.glass_size() < MAX_SIZE {
                 self.glass_insert(key, value);
-            } else {
-                if let Some((worst_key, worst_v)) = self.glass_max() {
-                    if key < worst_key {
-                        self.glass_remove(worst_key);
-                        unsafe {
-                            let preempt = &mut *self.preempt.get();
-                            preempt.insert(worst_key, worst_v);
-                        }
-                        self.preempt_bounds_valid.set(false);
-                        self.preempt_dirty.set(true);
-                        self.glass_insert(key, value);
-                    } else {
-                        unsafe {
-                            let preempt = &mut *self.preempt.get();
-                            preempt.insert(key, value);
-                        }
-                        self.preempt_bounds_valid.set(false);
-                        self.preempt_dirty.set(true);
-                    }
-                } else {
+            } else if let Some((worst_key, worst_v)) = self.glass_max() {
+                if key < worst_key {
+                    self.glass_remove(worst_key);
+                    self.preempt_insert(worst_key, worst_v);
                     self.glass_insert(key, value);
+                } else {
+                    self.preempt_insert(key, value);
                 }
+            } else {
+                self.glass_insert(key, value);
             }
         } else {
-            unsafe {
-                let preempt = &mut *self.preempt.get();
-                preempt.insert(key, value);
-            }
-            self.preempt_bounds_valid.set(false);
-            self.preempt_dirty.set(true);
+            self.preempt_insert(key, value);
         }
     }
 
@@ -285,24 +360,49 @@ impl Glass {
             .map(|value| (key_to_remove, value))
     }
 
+    // Paper §3: adjust() deletes a price level whose amount reaches zero. A
+    // zero value must never stay behind an occupied mask bit.
     #[inline(always)]
     pub fn update_value(&mut self, key: u32, f: impl FnOnce(&mut u64)) -> bool {
         if self.check_bounds_and_thres(key) {
-            if let Some(mut_ref) = self.glass_get_mut(key) {
-                f(mut_ref);
-                true
-            } else {
-                false
-            }
-        } else {
-            unsafe {
-                if let Some(v) = (*self.preempt.get()).get_mut(&key) {
-                    f(v);
-                    true
-                } else {
-                    false
+            match self.glass_get_mut(key) {
+                Some(mut_ref) => {
+                    f(mut_ref);
+                    if *mut_ref != 0 {
+                        return true;
+                    }
+                    // Restore occupancy so glass_remove can find and unlink
+                    // the slot, then remove it properly.
+                    *mut_ref = 1;
                 }
+                None => return false,
             }
+            self.remove_zeroed_glass_value(key);
+            true
+        } else {
+            let became_zero = unsafe {
+                let preempt = &mut *self.preempt.get();
+                match preempt.get_mut(&key) {
+                    Some(v) => {
+                        f(v);
+                        *v == 0
+                    }
+                    None => return false,
+                }
+            };
+            if became_zero {
+                self.preempt_remove(key);
+            }
+            true
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn remove_zeroed_glass_value(&mut self, key: u32) {
+        self.glass_remove(key);
+        if self.glass_size() < MAX_SIZE && !unsafe { (*self.preempt.get()).is_empty() } {
+            self.restructure();
         }
     }
 
@@ -310,124 +410,57 @@ impl Glass {
     pub fn remove(&mut self, key: u32) -> Option<u64> {
         if self.check_bounds_and_thres(key) {
             let res = self.glass_remove(key);
-            if res.is_some() && self.glass_size() < MAX_SIZE {
+            if res.is_some()
+                && self.glass_size() < MAX_SIZE
+                && !unsafe { (*self.preempt.get()).is_empty() }
+            {
                 self.restructure();
             }
             res
         } else {
-            unsafe {
-                let preempt = &mut *self.preempt.get();
-                preempt.remove(&key).inspect(|_val| {
-                    if preempt.is_empty() {
-                        self.thres.set(u32::MAX);
-                        self.preempt_min.set(u32::MAX);
-                        self.preempt_max.set(0);
-                        self.preempt_bounds_valid.set(true);
-                        self.preempt_dirty.set(false);
-                    } else {
-                        self.preempt_bounds_valid.set(false);
-                        self.preempt_dirty.set(true);
-                    }
-                })
-            }
+            self.preempt_remove(key)
         }
     }
 
     #[inline(always)]
     fn check_bounds_and_thres(&self, key: u32) -> bool {
-        let thres = self.thres.get();
-        if thres == u32::MAX && !self.preempt_bounds_valid.get() {
+        if !self.preempt_bounds_valid.get() {
             self.update_preempt_bounds();
         }
         key < self.thres.get()
     }
 
+    // Two-tier invariant: every glass key is strictly below thres, and thres
+    // is the minimum preempt key. So the global min is the glass min when the
+    // glass is non-empty, and the global max is the preempt max when the
+    // preempt map is non-empty.
     #[inline(always)]
     pub fn min(&self) -> Option<(u32, u64)> {
+        if let Some(t) = self.glass_min() {
+            return Some(t);
+        }
+        let preempt = unsafe { &*self.preempt.get() };
+        if preempt.is_empty() {
+            return None;
+        }
         if !self.preempt_bounds_valid.get() {
             self.update_preempt_bounds();
         }
-
-        let glass_min = self.glass_min();
-        let preempt_min_key = self.preempt_min.get();
-        let preempt_has_min = preempt_min_key != u32::MAX;
-
-        match (glass_min, preempt_has_min) {
-            (Some((t_key, t_val)), true) => {
-                if t_key <= preempt_min_key {
-                    Some((t_key, t_val))
-                } else {
-                    let v = unsafe {
-                        *self
-                            .preempt
-                            .get()
-                            .as_ref()
-                            .unwrap()
-                            .get(&preempt_min_key)
-                            .unwrap()
-                    };
-                    Some((preempt_min_key, v))
-                }
-            }
-            (Some(t), false) => Some(t),
-            (None, true) => {
-                let v = unsafe {
-                    *self
-                        .preempt
-                        .get()
-                        .as_ref()
-                        .unwrap()
-                        .get(&preempt_min_key)
-                        .unwrap()
-                };
-                Some((preempt_min_key, v))
-            }
-            (None, false) => None,
-        }
+        let k = self.preempt_min.get();
+        Some((k, *preempt.get(&k).unwrap()))
     }
 
     #[inline(always)]
     pub fn max(&self) -> Option<(u32, u64)> {
-        if !self.preempt_bounds_valid.get() {
-            self.update_preempt_bounds();
-        }
-
-        let glass_max = self.glass_max();
-        let preempt_max_key = self.preempt_max.get();
-        let preempt_has_max = preempt_max_key != 0;
-
-        match (glass_max, preempt_has_max) {
-            (Some((t_key, t_val)), true) => {
-                if t_key >= preempt_max_key {
-                    Some((t_key, t_val))
-                } else {
-                    let v = unsafe {
-                        *self
-                            .preempt
-                            .get()
-                            .as_ref()
-                            .unwrap()
-                            .get(&preempt_max_key)
-                            .unwrap()
-                    };
-                    Some((preempt_max_key, v))
-                }
+        let preempt = unsafe { &*self.preempt.get() };
+        if !preempt.is_empty() {
+            if !self.preempt_bounds_valid.get() {
+                self.update_preempt_bounds();
             }
-            (Some(t), false) => Some(t),
-            (None, true) => {
-                let v = unsafe {
-                    *self
-                        .preempt
-                        .get()
-                        .as_ref()
-                        .unwrap()
-                        .get(&preempt_max_key)
-                        .unwrap()
-                };
-                Some((preempt_max_key, v))
-            }
-            (None, false) => None,
+            let k = self.preempt_max.get();
+            return Some((k, *preempt.get(&k).unwrap()));
         }
+        self.glass_max()
     }
 
     #[inline(always)]
@@ -469,86 +502,282 @@ impl Glass {
         let mut to_move = vec![];
         unsafe {
             let preempt = &mut *self.preempt.get();
-            let keys = &*self.sorted_preempt_keys.get();
-            for &k in keys.iter().take(n) {
+            let keys = &mut *self.sorted_preempt_keys.get();
+            let mut take = n.min(keys.len());
+            // u32::MAX can never satisfy `key < thres` (thres saturates at
+            // u32::MAX, the paper's "infinity"), so it must stay in the
+            // preempt tier to remain routable. Sorted, so it can only be last.
+            if take > 0 && keys[take - 1] == u32::MAX {
+                take -= 1;
+            }
+            for &k in keys.iter().take(take) {
                 if let Some(v) = preempt.remove(&k) {
                     to_move.push((k, v));
                 }
             }
+            keys.drain(..take);
+            // The drained sorted list is exact, so the bounds are too.
+            if keys.is_empty() {
+                self.thres.set(u32::MAX);
+                self.preempt_min.set(u32::MAX);
+                self.preempt_max.set(0);
+            } else {
+                let new_min = keys[0];
+                let new_max = *keys.last().unwrap();
+                self.thres.set(new_min);
+                self.preempt_min.set(new_min);
+                self.preempt_max.set(new_max);
+            }
         }
+        self.preempt_bounds_valid.set(true);
+        self.preempt_dirty.set(false);
         for (k, v) in to_move {
             self.glass_insert(k, v);
         }
-        self.preempt_bounds_valid.set(false);
-        self.preempt_dirty.set(true);
+    }
+
+    // Sum of quantities and slot-weighted quantities of a leaf. Empty slots
+    // hold 0, so no mask filtering is needed: the whole-leaf cost is
+    // base * sum(qty) + sum(slot * qty).
+    #[inline(always)]
+    fn leaf_sums(&self, values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
+        if self.has_avx512 {
+            unsafe { leaf_sums_avx512(values) }
+        } else {
+            leaf_sums_scalar(values)
+        }
     }
 
     #[inline(always)]
+    fn prefetch_leaf(&self, leaf_idx: u32) {
+        if leaf_idx != u32::MAX {
+            unsafe {
+                _mm_prefetch(
+                    std::ptr::from_ref(&self.leaf_arena[leaf_idx as usize]) as *const i8,
+                    _MM_HINT_T0,
+                );
+            }
+        }
+    }
+
+    // Market-order execution. Consumes whole leaves at a time: one vectorized
+    // sum + one ancestor-count walk per 64 price levels, instead of a full
+    // min()/remove()/restructure() cycle per level.
     pub fn buy_shares(&mut self, mut shares_to_buy: u64) -> u64 {
         let mut total_cost = 0u64;
 
-        if self.glass_size() == 0 && !unsafe { (&*self.preempt.get()).is_empty() } {
-            self.restructure();
-        }
-
         while shares_to_buy > 0 {
-            if let Some((price, avail_at_price)) = self.min() {
-                if avail_at_price <= shares_to_buy {
-                    total_cost += (price as u64) * avail_at_price;
-                    shares_to_buy -= avail_at_price;
-                    self.remove(price);
-                } else {
-                    total_cost += (price as u64) * shares_to_buy;
-                    self.update_value(price, |avail| *avail -= shares_to_buy);
-                    shares_to_buy = 0;
+            if self.glass_size() == 0 {
+                if unsafe { (*self.preempt.get()).is_empty() } {
+                    break;
                 }
-            } else {
+                self.restructure();
+                if self.glass_size() > 0 {
+                    continue;
+                }
+                // Only the pinned u32::MAX level can be left in the preempt
+                // tier (restructure never moves it into the glass).
+                let avail = unsafe { (*self.preempt.get()).get(&u32::MAX).copied() };
+                let Some(avail) = avail else { break };
+                let buy = avail.min(shares_to_buy);
+                total_cost = total_cost.saturating_add((u32::MAX as u64).saturating_mul(buy));
+                if buy == avail {
+                    self.preempt_remove(u32::MAX);
+                } else {
+                    unsafe {
+                        *(*self.preempt.get()).get_mut(&u32::MAX).unwrap() -= buy;
+                    }
+                }
                 break;
             }
+
+            let leaf_idx = self.min_leaf.get();
+            let (mask, base, next_leaf) = {
+                let leaf = &self.leaf_arena[leaf_idx as usize];
+                (
+                    leaf.mask,
+                    (leaf.ht_k as u64) << BITS_PER_LEVEL,
+                    leaf.next_leaf,
+                )
+            };
+            self.prefetch_leaf(next_leaf);
+            let (qty_total, weighted) = self.leaf_sums(&self.leaf_arena[leaf_idx as usize].values);
+
+            if qty_total <= shares_to_buy {
+                // Consume the entire leaf.
+                total_cost = total_cost
+                    .saturating_add(base.saturating_mul(qty_total))
+                    .saturating_add(weighted);
+                shares_to_buy -= qty_total;
+                self.remove_min_leaf(leaf_idx, mask);
+            } else {
+                // Partial: walk set bits from the cheapest slot up.
+                let leaf = &mut self.leaf_arena[leaf_idx as usize];
+                let mut m = mask;
+                let mut consumed_slots = 0u32;
+                while shares_to_buy > 0 {
+                    let slot = m.trailing_zeros() as usize;
+                    let price = base | slot as u64;
+                    let qty = leaf.values[slot];
+                    if qty <= shares_to_buy {
+                        total_cost = total_cost.saturating_add(price.saturating_mul(qty));
+                        shares_to_buy -= qty;
+                        leaf.values[slot] = 0;
+                        leaf.mask &= !(1u64 << slot);
+                        consumed_slots += 1;
+                        m &= m - 1;
+                    } else {
+                        total_cost = total_cost.saturating_add(price.saturating_mul(shares_to_buy));
+                        leaf.values[slot] -= shares_to_buy;
+                        shares_to_buy = 0;
+                    }
+                }
+                let partial = (base >> BITS_PER_LEVEL) as u32;
+                let new_min_slot = self.leaf_arena[leaf_idx as usize].mask.trailing_zeros();
+                self.min_key.set((base as u32) | new_min_slot);
+                if consumed_slots > 0 {
+                    self.decrement_ancestor_counts(partial, consumed_slots);
+                }
+                break;
+            }
+        }
+
+        if self.glass_size() < MAX_SIZE && !unsafe { (*self.preempt.get()).is_empty() } {
+            self.restructure();
         }
         total_cost
     }
 
+    // Unlink and free the current minimum leaf whose (pre-consumption)
+    // occupancy mask is `mask`. Ancestor counts, the leaf list, the intrusive
+    // hash table, min/max bookkeeping and the cached path are all maintained.
+    fn remove_min_leaf(&mut self, leaf_idx: u32, mask: u64) {
+        let n = mask.count_ones();
+        let (partial, next_l) = {
+            let leaf = &mut self.leaf_arena[leaf_idx as usize];
+            let p = leaf.ht_k;
+            let nl = leaf.next_leaf;
+            leaf.mask = 0;
+            leaf.values = [0; NUM_CHILDREN];
+            (p, nl)
+        };
+
+        if next_l != u32::MAX {
+            self.leaf_arena[next_l as usize].prev_leaf = u32::MAX;
+        } else {
+            self.max_leaf.set(u32::MAX);
+            self.max_key.set(0);
+        }
+        self.min_leaf.set(next_l);
+        if next_l != u32::MAX {
+            let nleaf = &self.leaf_arena[next_l as usize];
+            let slot = nleaf.mask.trailing_zeros();
+            self.min_key.set((nleaf.ht_k << BITS_PER_LEVEL) | slot);
+        } else {
+            self.min_key.set(u32::MAX);
+        }
+        self.ht_remove(leaf_idx);
+        self.leaf_free_list.push(leaf_idx);
+
+        let mut path: [(u32, usize); NUM_LEVELS - 1] = [(0, 0); NUM_LEVELS - 1];
+        let mut node_idx = self.root;
+        for l in 0..NUM_LEVELS - 1 {
+            let shift = (NUM_LEVELS - 2 - l) * BITS_PER_LEVEL;
+            let slot = ((partial >> shift) & 0x3F) as usize;
+            path[l] = (node_idx, slot);
+            let next = self.arena[node_idx as usize].children[slot];
+            self.arena[node_idx as usize].count -= n;
+            node_idx = next;
+        }
+        debug_assert_eq!(node_idx, leaf_idx);
+        for l in (0..NUM_LEVELS - 1).rev() {
+            let (parent, slot) = path[l];
+            self.arena[parent as usize].children[slot] = u32::MAX;
+            self.arena[parent as usize].mask &= !(1u64 << slot);
+            if self.arena[parent as usize].mask == 0 && l > 0 {
+                self.free_list.push(parent);
+            } else {
+                break;
+            }
+        }
+
+        // Cached path entries may point into the freed subtree only when the
+        // cached key shared this leaf (shared shallower ancestors survive:
+        // their masks are non-zero).
+        if let Some(lk) = self.cached_last_key.get() {
+            if (lk >> BITS_PER_LEVEL) == partial {
+                self.cached_last_key.set(None);
+                self.cached_d.set(0);
+            }
+        }
+    }
+
     #[inline(always)]
+    fn decrement_ancestor_counts(&mut self, partial: u32, n: u32) {
+        let mut node_idx = self.root;
+        for l in 0..NUM_LEVELS - 1 {
+            let shift = (NUM_LEVELS - 2 - l) * BITS_PER_LEVEL;
+            let slot = ((partial >> shift) & 0x3F) as usize;
+            let node = &mut self.arena[node_idx as usize];
+            node.count -= n;
+            node_idx = node.children[slot];
+        }
+    }
+
+    // Cost estimation without mutation. The first leaf is scanned per-slot
+    // (small targets exit there without paying for a full-leaf reduction);
+    // every subsequent leaf that is wholly consumed uses the vectorized sums.
     pub fn compute_buy_cost(&self, mut target_shares: u64) -> u64 {
         let mut total_cost = 0u64;
-        
+
         let mut curr_leaf_idx = self.min_leaf.get();
+        let mut first = true;
         while curr_leaf_idx != u32::MAX && target_shares > 0 {
             let leaf = &self.leaf_arena[curr_leaf_idx as usize];
-            let base_key = leaf.ht_k << BITS_PER_LEVEL;
-            let mut mask = leaf.mask;
-            
-            // For the very first leaf, we might need to skip some bits
-            if base_key == (self.min_key.get() & !0x3F) {
-                let start_slot = (self.min_key.get() & 0x3F) as usize;
-                mask &= !((1u64 << start_slot) - 1);
-            }
+            let base = (leaf.ht_k as u64) << BITS_PER_LEVEL;
 
+            if !first {
+                // Deep sweep: prefetch the successor while summing this leaf.
+                self.prefetch_leaf(leaf.next_leaf);
+                let (qty_total, weighted) = self.leaf_sums(&leaf.values);
+                if qty_total <= target_shares {
+                    total_cost = total_cost
+                        .saturating_add(base.saturating_mul(qty_total))
+                        .saturating_add(weighted);
+                    target_shares -= qty_total;
+                    curr_leaf_idx = leaf.next_leaf;
+                    continue;
+                }
+            }
+            first = false;
+
+            let mut mask = leaf.mask;
             while mask != 0 {
                 let slot = if self.has_bmi1 {
                     unsafe { _tzcnt_u64(mask) as usize }
                 } else {
                     mask.trailing_zeros() as usize
                 };
-                
-                let price = base_key | (slot as u32);
+
+                let price = base | slot as u64;
                 let qty = leaf.values[slot];
                 let buy = qty.min(target_shares);
-                total_cost = total_cost.saturating_add((price as u64).saturating_mul(buy));
+                total_cost = total_cost.saturating_add(price.saturating_mul(buy));
                 target_shares -= buy;
-                
-                if target_shares == 0 { return total_cost; }
-                
+
+                if target_shares == 0 {
+                    return total_cost;
+                }
+
                 if self.has_bmi1 {
-                    unsafe { mask = _blsr_u64(mask); }
+                    unsafe { mask = _blsr_u64(mask) };
                 } else {
                     mask &= !(1u64 << slot);
                 }
             }
             curr_leaf_idx = leaf.next_leaf;
         }
-        
+
         if target_shares > 0 {
             self.ensure_sorted_preempt_keys();
             let sorted_keys = unsafe { &*self.sorted_preempt_keys.get() };
@@ -581,7 +810,7 @@ impl Glass {
         let mut node_idx = self.root;
         let mut leaf_idx = u32::MAX;
 
-        if let Some(l_idx) = self.ht_lookup(partial) {
+        if let Some(l_idx) = self.find_leaf(partial) {
             leaf_idx = l_idx;
         }
 
@@ -753,7 +982,7 @@ impl Glass {
     #[inline(always)]
     fn glass_get(&self, key: u32) -> Option<u64> {
         let partial = key >> BITS_PER_LEVEL;
-        if let Some(leaf_idx) = self.ht_lookup(partial) {
+        if let Some(leaf_idx) = self.find_leaf(partial) {
             let v = self.leaf_arena[leaf_idx as usize].values[(key & 0x3F) as usize];
             if v > 0 {
                 return Some(v);
@@ -765,7 +994,7 @@ impl Glass {
     #[inline(always)]
     fn glass_get_mut(&mut self, key: u32) -> Option<&mut u64> {
         let partial = key >> BITS_PER_LEVEL;
-        if let Some(leaf_idx) = self.ht_lookup(partial) {
+        if let Some(leaf_idx) = self.find_leaf(partial) {
             let v = &mut self.leaf_arena[leaf_idx as usize].values[(key & 0x3F) as usize];
             if *v > 0 {
                 return Some(v);
@@ -777,7 +1006,7 @@ impl Glass {
     #[inline(always)]
     fn glass_remove(&mut self, key: u32) -> Option<u64> {
         let partial = key >> BITS_PER_LEVEL;
-        let leaf_idx = self.ht_lookup(partial)?;
+        let leaf_idx = self.find_leaf(partial)?;
         let leaf_slot = (key & 0x3F) as usize;
         let removed_val = self.leaf_arena[leaf_idx as usize].values[leaf_slot];
         if removed_val == 0 { return None; }
@@ -927,6 +1156,41 @@ impl Glass {
         let pos = if self.has_lzcnt { unsafe { (63 - _lzcnt_u64(mask)) as usize } }
                   else { 63 - mask.leading_zeros() as usize };
         Some(pos)
+    }
+}
+
+// (sum(qty), sum(slot * qty)) over all 64 slots; empty slots are 0 and
+// contribute nothing. Sums wrap on overflow (unreachable for realistic
+// order-book quantities); callers combine results with saturating arithmetic.
+#[inline(always)]
+fn leaf_sums_scalar(values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
+    let mut qty = 0u64;
+    let mut weighted = 0u64;
+    for (i, &v) in values.iter().enumerate() {
+        qty = qty.wrapping_add(v);
+        weighted = weighted.wrapping_add((i as u64).wrapping_mul(v));
+    }
+    (qty, weighted)
+}
+
+// 8 x 512-bit lanes; vpmullq needs AVX-512DQ (Skylake-SP/Cascade Lake+).
+#[target_feature(enable = "avx512f,avx512dq")]
+fn leaf_sums_avx512(values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
+    unsafe {
+        let mut qty = _mm512_setzero_si512();
+        let mut weighted = _mm512_setzero_si512();
+        let mut idx = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
+        let eight = _mm512_set1_epi64(8);
+        for chunk in 0..NUM_CHILDREN / 8 {
+            let v = _mm512_loadu_si512(values.as_ptr().add(chunk * 8) as *const _);
+            qty = _mm512_add_epi64(qty, v);
+            weighted = _mm512_add_epi64(weighted, _mm512_mullo_epi64(v, idx));
+            idx = _mm512_add_epi64(idx, eight);
+        }
+        (
+            _mm512_reduce_add_epi64(qty) as u64,
+            _mm512_reduce_add_epi64(weighted) as u64,
+        )
     }
 }
 

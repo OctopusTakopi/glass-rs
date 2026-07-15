@@ -208,6 +208,60 @@ fn bench_buy_shares(c: &mut Criterion) {
     });
 }
 
+/// Deep sweeps spanning many leaves: exercises whole-leaf (vectorized)
+/// consumption instead of the first-leaf partial path.
+fn bench_deep_sweep(c: &mut Criterion) {
+    let keys = generate_random_keys(N);
+    let values = generate_random_values(N);
+    let deep_target = 500_000u64; // consumes most of the ~1500-level book
+
+    let mut glass = Glass::new();
+    for i in 0..N {
+        glass.insert(keys[i], values[i]);
+    }
+    c.bench_function("compute_buy_cost_deep", |b| {
+        b.iter(|| black_box(glass.compute_buy_cost(black_box(deep_target))))
+    });
+
+    let mut map = BTreeMap::new();
+    for i in 0..N {
+        map.insert(keys[i], values[i]);
+    }
+    c.bench_function("compute_buy_cost_deep_btree", |b| {
+        b.iter(|| black_box(compute_buy_cost_btree(&map, black_box(deep_target))))
+    });
+
+    c.bench_function("buy_shares_deep", |b| {
+        b.iter_with_setup(
+            || {
+                let mut glass = Glass::new();
+                for i in 0..N {
+                    glass.insert(keys[i], values[i]);
+                }
+                glass
+            },
+            |mut glass| {
+                black_box(glass.buy_shares(black_box(deep_target)));
+            },
+        )
+    });
+
+    c.bench_function("buy_shares_deep_btree", |b| {
+        b.iter_with_setup(
+            || {
+                let mut map = BTreeMap::new();
+                for i in 0..N {
+                    map.insert(keys[i], values[i]);
+                }
+                map
+            },
+            |mut map| {
+                black_box(buy_shares_btree(&mut map, black_box(deep_target)));
+            },
+        )
+    });
+}
+
 /// Benchmarks the `remove_by_index` function under different scenarios.
 fn bench_remove_by_index(c: &mut Criterion) {
     let keys = generate_random_keys(N);
@@ -429,7 +483,7 @@ criterion_group! {
     name = benches;
     config = Criterion::default().measurement_time(Duration::from_secs(6));
     targets = bench_insert, bench_get, bench_remove, bench_min_max, bench_compute_buy_cost,
-        bench_buy_shares, bench_remove_by_index, bench_remove_by_index_btree
+        bench_buy_shares, bench_deep_sweep, bench_remove_by_index, bench_remove_by_index_btree
 }
 
 criterion_main!(benches);

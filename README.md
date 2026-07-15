@@ -1,43 +1,72 @@
-# Glass - Ordered Set Data Structure for Client-Side Order Books (Rust Implementation)
+# Glass — Ordered Set Data Structure for Client-Side Order Books (Rust)
 
-This repository contains a Rust implementation of the "glass" data structure, as described in the paper ["glass: ordered set data structure for client-side order books"](https://arxiv.org/abs/2506.13991) by Viktor Krapivensky. The glass structure is a trie-based ordered set optimized for integer keys and sequential locality, particularly suited for managing client-side order books in market data applications. It supports operations like insert, erase, find, min, max, and order book-specific features such as computing buy costs and removing by index.
+A Rust implementation of the **glass** data structure from the paper
+["glass: ordered set data structure for client-side order books"](https://arxiv.org/abs/2506.13991)
+by Viktor Krapivensky, with inspiration from the reference C implementation at
+[shdown/glass-paper](https://github.com/shdown/glass-paper).
 
-The implementation draws inspiration from the original C code in the [shdown/glass-paper](https://github.com/shdown/glass-paper) repository but is adapted for Rust, leveraging features like cell-based interior mutability, x86 intrinsics, and a custom intrusive hash table.
+Glass is a trie-based ordered map from `u32` prices to `u64` quantities,
+optimized for the access patterns of market data: *sequential locality* (events
+cluster near the last touched price) and *edge locality* (events cluster near
+the best price). It supports `insert`, `remove`, `get`, `update_value`, `min`,
+`max`, `remove_by_index`, and order-book-specific operations `buy_shares`
+(market-order execution) and `compute_buy_cost` (cost estimation).
 
 ## Why Glass is Fast
 
-Glass achieves significant speedups (up to **24x over BTreeMap**) by optimizing for the specific access patterns of market data:
+1. **Digital search (radix trie)** — key bits are array indices: a fixed,
+   shallow 6-level trie (6 bits per level, 36-bit padded key space) with no
+   comparison-driven branching.
+2. **Cached path** — the traversal path to the last accessed key is memoized.
+   A new key resumes from the deepest shared ancestor (paper §5.1), making
+   sequential operations effectively O(1).
+3. **Bounded cache table (paper §5.2)** — an intrusive hash table embedded in
+   the leaf nodes maps partial keys to leaves with a hard O(1) probe bound.
+   The probe is *tri-state*: found / definitively absent / "don't know", and
+   the rare "don't know" (chain longer than 5) falls back to a trie descent,
+   so lookups are both bounded *and* exact.
+4. **Linked leaf list** — leaves form a doubly-linked list: O(1) successor and
+   predecessor at the leaf level.
+5. **Whole-leaf consumption** — `buy_shares` and `compute_buy_cost` process 64
+   price levels at a time: one vectorized sum plus one ancestor walk per leaf,
+   instead of per-level tree operations.
+6. **Hardware acceleration** — BMI1/BMI2/LZCNT bit scans, and AVX-512F/DQ
+   (`vpmullq`) leaf reductions where available. All CPU features are detected
+   at runtime with portable fallbacks.
+7. **Preemption principle (paper §4.5)** — the trie holds only the best
+   `MAX_SIZE` (4096) price levels; worse levels overflow into a hash map and
+   are pulled back by `restructure()` as the trie drains. This bounds memory
+   and keeps the hot book compact in cache.
 
-1.  **Digital Search (Radix Trie)**: Unlike B-Trees which use comparison-based logic ($O(\log N)$ branches), Glass uses the bits of the key as array indices. This results in a fixed, shallow depth (6 levels for 32-bit keys) and eliminates expensive comparison-driven branching.
-2.  **Sequential Locality (Cached Path)**: Market events usually occur near the "best" price or the last processed price. Glass caches the traversal path to the last accessed key. If the next key shares a prefix (high `lambda`), Glass jumps directly to the shared ancestor, making sequential operations effectively $O(1)$.
-3.  **Intrusive Bounded Hash Table**: For point lookups, Glass uses an intrusive hash table embedded directly in the leaf nodes. This provides a hard-bounded $O(1)$ lookup to the "pre-leaf" level, bypassing trie traversal entirely for frequently accessed price levels.
-4.  **Linked Leaf List**: Leaf nodes are organized in a doubly-linked list. This allows **O(1) transitions** to the next or previous price level. This is why market order execution (`buy_shares`) is exponentially faster than B-Trees, which must traverse tree levels to find successors.
-5.  **Hardware Acceleration**: Glass leverages x86-64 bit manipulation instructions (BMI1, BMI2, LZCNT). Instructions like `_tzcnt_u64` and `_bzhi_u64` allow scanning 64 price levels in a single CPU cycle to find the next available quote.
-6.  **Dual-Arena Density**: By using separate arenas for Internal and Leaf nodes, Glass packs up to 64 sequential price levels into a single contiguous `LeafNode`, maximizing L1/L2 cache efficiency.
+## Correctness
 
-## WARN
+The two-tier design maintains a strict invariant: every trie key is below the
+preemption threshold, which always equals the minimum preempted key and is
+updated eagerly on every preemption (as required by paper §4.5). The cache
+table implements the paper's tri-state probe semantics exactly.
 
-WARN: This implementation is a high-performance refactor optimized for **Intel(R) Xeon(R) Gold 6230** architecture. It is significantly faster than the initial proof-of-concept but remains a specialized tool for single-threaded market data processing.
+The test suite includes a 200,000-operation randomized differential test
+against `BTreeMap` (deterministic seed) plus targeted regression tests for
+historical bugs: hash-chain overflow with colliding keys, stale thresholds
+after eviction, zero-value handling in `update_value`, and boundary keys
+`0` / `u32::MAX`. Run it with:
 
-## Key Features
+```bash
+cargo test                     # unit + differential tests
+cargo test --release           # exercises the AVX-512 paths under optimization
+```
 
-- **Trie-based Structure**: A radix trie with 6 bits per level (64 children per node) for efficient storage and traversal of 32-bit integer keys.
-- **Linked Leaf List**: O(1) successor/predecessor access for fast market order aggregation.
-- **Cached Path**: Exploits sequential locality for faster traversals.
-- **Bounded HT Cache**: Hard O(1) lookups to pre-leaf nodes via intrusive chaining.
-- **Hardware Acceleration**: Utilizes x86-64 BMI1, BMI2, and LZCNT intrinsics.
-- **Preemption and Restructure**: Maintains a maximum glass size (default: 4096) to keep the "hot" portion of the book in the fast trie.
-- **Order Book Optimizations**: Fast `buy_shares` (market order) and `compute_buy_cost` (estimation) logic.
+### Semantics worth knowing
 
-## Technologies Used
+- A value of `0` means "absent": `insert(key, 0)` deletes the level, and an
+  `update_value` that reaches 0 removes the level (the paper's `adjust`).
+- Cost arithmetic (`buy_shares`, `compute_buy_cost`) is saturating.
+- The structure is single-threaded by design (`Send` but not `Sync`): reads
+  mutate internal caches through interior mutability.
+- Key `u32::MAX` (the threshold's saturation point, the paper's "∞") is fully
+  supported but always lives in the overflow tier.
 
-- **Rust**: Core language (version 1.60+ for intrinsics).
-- **Crates**:
-  - `ahash`: Used for internal hash distributions.
-  - `std::arch::x86_64`: For CPU feature detection and intrinsics (BMI1, BMI2, LZCNT).
-- **Hardware**: Best performance achieved on x86-64 with BMI2 support.
-
-## Usage Examples
+## Usage
 
 ```rust
 use glass_rs::Glass;
@@ -45,49 +74,60 @@ use glass_rs::Glass;
 fn main() {
     let mut glass = Glass::new();
 
-    // Insert key-value pairs (price: quantity)
-    glass.insert(100, 500); 
+    // Insert price levels (price -> quantity)
+    glass.insert(100, 500);
     glass.insert(110, 300);
     glass.insert(90, 400);
 
-    // Get a value
-    if let Some(quantity) = glass.get(100) {
-        println!("Quantity at 100: {}", quantity);
-    }
+    assert_eq!(glass.get(100), Some(500));
+    assert_eq!(glass.min(), Some((90, 400)));
+    assert_eq!(glass.max(), Some((110, 300)));
 
-    // Execute buy order (modifies book, deletes depleted levels)
-    let total_cost = glass.buy_shares(700);
-    println!("Buy cost: {}", total_cost);
-
-    // Get min and max
-    println!("Min: {:?}", glass.min());
+    // Estimate, then execute a market order for 700 shares
+    let est = glass.compute_buy_cost(700);
+    let cost = glass.buy_shares(700);
+    assert_eq!(est, cost); // 90*400 + 100*300
+    assert_eq!(glass.get(90), None); // level consumed
 }
 ```
 
 ## Configuration
 
 Constants at the top of `src/lib.rs`:
-- `BITS_PER_LEVEL`: 6 (Power of 2, radix size).
-- `MAX_SIZE`: 4096 (Trie capacity before preemption).
-- `ARENA_CAPACITY`: Initial node allocation.
+
+- `BITS_PER_LEVEL` (6): radix width. Not freely tunable — masks and shifts
+  assume 6.
+- `MAX_SIZE` (4096): trie capacity before preemption kicks in.
+- `HT_SIZE` (4096) / `HT_MAX_LOOKUP_LEN` (5): cache-table geometry (paper's J).
+- `ARENA_CAPACITY` / `LEAF_ARENA_CAPACITY`: initial node pre-allocation.
 
 ## Benchmarks
 
-Benchmarks were run on an **Intel(R) Xeon(R) Gold 6230 CPU @ 2.10GHz**. Bulk operations performed 1,000,000 operations on a set with sequential/local keys.
+Run on an **Intel Xeon Gold 6230 @ 2.10GHz** (Cascade Lake: AVX-512F/DQ, BMI2)
+with `cargo bench`. Bulk operations perform 1,000,000 operations against a book
+of ~1,500 price levels with sequential/local keys; nanoseconds per operation.
+Absolute numbers vary with machine load — the glass/BTreeMap ratio within a
+run is the stable signal.
 
-| Operation              | Glass (ns/op) | BTreeMap (ns/op) | Speedup (Glass faster by) |
-|------------------------|---------------|------------------|---------------------------|
-| Insert                | 11.11         | 97.44           | 8.77x                    |
-| Get Existing          | 5.76          | 86.94           | 15.09x                   |
-| Get Non-Existing      | 5.77          | 86.99           | 15.07x                   |
-| Remove (Inc. Insert)  | 14.11         | 98.90           | 7.01x                    |
-| Min                   | 6.24          | 5.23            | 0.84x (BTree faster)     |
-| Max                   | 4.39          | 6.24            | 1.42x                    |
-| **Compute Buy Cost**  | **17.62**     | **14.92**       | **~0.8x (Parity)**       |
-| **Buy Shares (Market)**| **740.09**    | **18108.00**    | **24.47x**               |
-| Remove by Index (Start)| 110680        | 107690          | 0.97x (Parity)           |
-| Remove by Index (End)  | 573260        | 4826100         | 8.42x                    |
-| Remove by Index (Random)| 402600       | 2671400         | 6.63x                    |
+| Operation                        | Glass (ns/op) | BTreeMap (ns/op) | Speedup   |
+|----------------------------------|---------------|------------------|-----------|
+| Insert                           | 5.88          | 51.98            | 8.8x      |
+| Get (existing)                   | 2.66          | 51.27            | 19.3x     |
+| Get (non-existing)               | 2.70          | 52.66            | 19.5x     |
+| Remove (incl. insert)*           | 8.60          | 56.67            | 6.6x      |
+| Min                              | 2.23          | 2.53             | 1.1x      |
+| Max                              | 3.26          | 3.44             | 1.1x      |
+| Compute Buy Cost (1k shares)     | 8.33          | 7.79             | ~parity   |
+| **Buy Shares (1k shares)**       | **621**       | **9,558**        | **15.4x** |
+| **Compute Buy Cost (500k, deep)**| **250**       | **2,436**        | **9.7x**  |
+| **Buy Shares (500k, deep)**      | **2,654**     | **42,892**       | **16.2x** |
+
+\* The remove benchmark re-inserts 1M keys per iteration; remove alone is
+≈2.7 ns/op after subtracting the insert cost.
+
+The *deep sweep* benchmarks execute/estimate a 500,000-share order spanning
+~24 leaves (≈1,500 price levels), which is where whole-leaf vectorized
+consumption dominates per-level tree walks.
 
 ## Reference
 
