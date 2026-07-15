@@ -1,71 +1,32 @@
 # Glass — Ordered Set Data Structure for Client-Side Order Books (Rust)
 
-A Rust implementation of the **glass** data structure from the paper
-["glass: ordered set data structure for client-side order books"](https://arxiv.org/abs/2506.13991)
-by Viktor Krapivensky, with inspiration from the reference C implementation at
-[shdown/glass-paper](https://github.com/shdown/glass-paper).
+Rust port of **glass** ([arXiv:2506.13991](https://arxiv.org/abs/2506.13991), Viktor Krapivensky; reference C at [shdown/glass-paper](https://github.com/shdown/glass-paper)): a trie-based ordered map from `u32` prices to `u64` quantities, built for client-side order books. It exploits the two localities of market data (events cluster near the last touched price and near the best price) and adds order-book primitives like market-order execution on top of a `BTreeMap`-style API.
 
-Glass is a trie-based ordered map from `u32` prices to `u64` quantities,
-optimized for the access patterns of market data: *sequential locality* (events
-cluster near the last touched price) and *edge locality* (events cluster near
-the best price). It supports `insert`, `remove`, `get`, `update_value`, `min`,
-`max`, `remove_by_index`, and order-book-specific operations `buy_shares`
-(market-order execution) and `compute_buy_cost` (cost estimation).
+## Benchmarks
 
-## Why Glass is Fast
+Intel Xeon Gold 6230 @ 2.10GHz, `cargo bench`, single run pinned to an idle core, JCC mitigation flag on (which also speeds up the BTreeMap baseline, so the ratios are honest). Bulk benches do 1M ops against a book of ~1,500 price levels with sequential/local keys.
 
-1. **Digital search (radix trie)** — key bits are array indices: a fixed,
-   shallow 6-level trie (6 bits per level, 36-bit padded key space) with no
-   comparison-driven branching.
-2. **Cached path** — the traversal path to the last accessed key is memoized.
-   A new key resumes from the deepest shared ancestor (paper §5.1), making
-   sequential operations effectively O(1).
-3. **Bounded cache table (paper §5.2)** — an intrusive hash table embedded in
-   the leaf nodes maps partial keys to leaves with a hard O(1) probe bound.
-   The probe is *tri-state*: found / definitively absent / "don't know", and
-   the rare "don't know" (chain longer than 5) falls back to a trie descent,
-   so lookups are both bounded *and* exact.
-4. **Linked leaf list** — leaves form a doubly-linked list: O(1) successor and
-   predecessor at the leaf level.
-5. **Whole-leaf consumption** — `buy_shares` and `compute_buy_cost` process 64
-   price levels at a time: one vectorized sum plus one ancestor walk per leaf,
-   instead of per-level tree operations.
-6. **Hardware acceleration** — BMI1/BMI2/LZCNT/POPCNT bit scans, and
-   AVX-512F/DQ (`vpmullq`) leaf reductions where available. All CPU features
-   are detected at runtime with portable fallbacks; the crate builds on any
-   architecture (CI checks aarch64).
-7. **Preemption principle (paper §4.5)** — the trie holds only the best
-   `MAX_SIZE` (4096) price levels; worse levels overflow into a hash map and
-   are pulled back by `restructure()` as the trie drains. This bounds memory
-   and keeps the hot book compact in cache.
+| Operation                         | Glass (ns/op) | BTreeMap (ns/op) | Speedup   |
+|-----------------------------------|---------------|------------------|-----------|
+| Insert                            | 4.09          | 50.41            | 12.3x     |
+| Get (existing)                    | 2.40          | 43.83            | 18.3x     |
+| Get (non-existing)                | 2.36          | 43.85            | 18.6x     |
+| Remove (incl. insert)*            | 5.02          | 51.07            | 10.2x     |
+| Min                               | 2.88          | 2.48             | 0.9x      |
+| Max                               | 3.68          | 3.16             | 0.9x      |
+| **Top 25 Levels (snapshot)**      | **29.8**      | **46.5**         | **1.6x**  |
+| Compute Buy Cost (1k shares)      | 8.16          | 6.30             | 0.8x      |
+| Compute Sell Cost (1k shares)     | 10.34         | 10.55            | ~parity   |
+| **Buy Shares (1k shares)**        | **577**       | **9,382**        | **16.3x** |
+| **Sell Shares (1k shares)**       | **703**       | **9,606**        | **13.7x** |
+| Compute Buy Cost (500k, deep)     | 358           | 2,006            | 5.6x      |
+| Compute Sell Cost (500k, deep)    | 334           | 2,037            | 6.1x      |
+| **Buy Shares (500k, deep)**       | **2,519**     | **31,063**       | **12.3x** |
+| **Sell Shares (500k, deep)**      | **2,519**     | **59,868**       | **23.8x** |
 
-## Correctness
+\* The remove bench re-inserts 1M keys per iteration; remove alone is ≈0.9 ns/op after subtracting the insert.
 
-The two-tier design maintains a strict invariant: every trie key is below the
-preemption threshold, which always equals the minimum preempted key and is
-updated eagerly on every preemption (as required by paper §4.5). The cache
-table implements the paper's tri-state probe semantics exactly.
-
-The test suite includes a 200,000-operation randomized differential test
-against `BTreeMap` (deterministic seed) plus targeted regression tests for
-historical bugs: hash-chain overflow with colliding keys, stale thresholds
-after eviction, zero-value handling in `update_value`, and boundary keys
-`0` / `u32::MAX`. Run it with:
-
-```bash
-cargo test                     # unit + differential tests
-cargo test --release           # exercises the AVX-512 paths under optimization
-```
-
-### Semantics worth knowing
-
-- A value of `0` means "absent": `insert(key, 0)` deletes the level, and an
-  `update_value` that reaches 0 removes the level (the paper's `adjust`).
-- Cost arithmetic (`buy_shares`, `compute_buy_cost`) is saturating.
-- The structure is single-threaded by design (`Send` but not `Sync`): reads
-  mutate internal caches through interior mutability.
-- Key `u32::MAX` (the threshold's saturation point, the paper's "∞") is fully
-  supported but always lives in the overflow tier.
+The *deep* rows execute/estimate a 500k-share order spanning ~24 leaves (≈1,500 levels), where whole-leaf vectorized consumption beats per-level tree walks. Absolute numbers vary with machine load; the glass/BTreeMap ratio within a run is the stable signal.
 
 ## Usage
 
@@ -98,133 +59,51 @@ fn main() {
 }
 ```
 
-### API surface
+## Why it's fast
 
-The map API mirrors `std::collections::BTreeMap` where it makes sense:
-`get`, `get_key_value`, `contains_key`, `insert`, `remove`, `len`,
-`is_empty`, `clear`, `iter`, `keys`, `values`, `range`, `first_key_value`,
-`last_key_value`, `pop_first`, `pop_last`, `retain`, `split_off`,
-`Extend`/`FromIterator`/`IntoIterator` (borrowed and owning), and `Debug`.
+- **Radix trie**: key bits are array indices. A fixed 6-level trie (6 bits/level), no comparison branching.
+- **Cached path**: the traversal to the last touched key is memoized; the next key resumes from the deepest shared ancestor (paper §5.1). Sequential access is effectively O(1).
+- **Bounded cache table** (paper §5.2): an intrusive hash table embedded in the leaves, hard 5-probe bound. Tri-state result (found / absent / don't-know); the rare don't-know falls back to a trie descent, so lookups are bounded *and* exact.
+- **Linked leaf list**: O(1) successor/predecessor across leaves.
+- **Whole-leaf consumption**: `buy_shares`/`compute_buy_cost` process 64 price levels at a time, one vectorized sum + one ancestor walk per leaf.
+- **Hardware acceleration**: BMI1/BMI2/LZCNT/POPCNT bit scans, AVX-512F/DQ leaf reductions. All runtime-detected with portable fallbacks; builds on any architecture (CI checks aarch64).
+- **Preemption** (paper §4.5): the trie holds only the best 4096 levels; worse levels overflow to a hash map and come back as the trie drains. The hot book stays compact in cache.
 
-Deliberately **not** provided: `get_mut`/`values_mut`/`entry` — a raw
-`&mut u64` would let callers write 0 and corrupt the occupancy invariant.
-Use `update_value` (closure-based in-place adjust; reaching zero deletes the
-level, per the paper's `adjust`).
+## API
 
-Order-book operations beyond the map API:
+The map API follows `std::collections::BTreeMap`: `get`, `get_key_value`, `contains_key`, `insert`, `remove`, `len`, `is_empty`, `clear`, `iter`, `keys`, `values`, `range`, `first_key_value`, `last_key_value`, `pop_first`, `pop_last`, `retain`, `split_off`, `Extend`/`FromIterator`/`IntoIterator`, `Debug`.
 
-- `buy_shares` / `compute_buy_cost` — market-order execution/estimation from
-  the *lowest* price upward (ask book).
-- `sell_shares` / `compute_sell_cost` — the mirror: execution/estimation from
-  the *highest* price downward (bid book). The overflow tier holds the
-  highest prices and is drained first; trie leaves are then consumed whole
-  from the max leaf backward with the same vectorized sums.
-- `next_level` / `prev_level` — successor/predecessor level (the paper's
-  `next`/`prev`), O(1) via the linked leaf list when the neighbor shares a
-  leaf.
-- `top_levels(n, &mut buf)` — snapshot of the best `n` levels into a
-  caller-owned buffer (allocation-free steady state); the imbalance-
-  computation access pattern. Dense leaves that are consumed whole extract
-  via AVX-512 `vpcompressq`, using the occupancy bitmap directly as the lane
-  mask.
-- `remove_by_index` — k-th smallest level, via per-subtree counts.
+On top of that:
 
-Note for deep bid books (> 4096 levels): the preemption tier keeps the
-*lowest* prices in the fast trie. If your workload is sell-heavy against a
-very deep book, store negated prices (`!price`) and use the buy-side
-operations so the best bids stay in the trie.
+- `buy_shares` / `compute_buy_cost`: execute or estimate a market order from the lowest price up (ask book).
+- `sell_shares` / `compute_sell_cost`: same from the highest price down (bid book).
+- `top_levels(n, &mut buf)`: snapshot of the best `n` levels into your own buffer, no allocation in steady state.
+- `next_level` / `prev_level`: successor and predecessor level.
+- `remove_by_index`: remove the k-th smallest level.
 
-See `cargo doc --open` and `examples/demo.rs`.
+Things to know:
 
-## Build configuration for Skylake/Cascade Lake (JCC erratum)
+- Quantity 0 means the level doesn't exist: `insert(key, 0)` deletes, and an `update_value` that hits 0 removes the level. This is also why there is no `get_mut`/`entry` (writing 0 through a raw `&mut u64` would corrupt the structure); use `update_value`.
+- Cost arithmetic saturates instead of overflowing.
+- Single-threaded (`Send` but not `Sync`); reads update internal caches.
+- `u32::MAX` is a valid key (the paper's "∞") but always sits in the overflow tier.
+- Only the lowest 4096 prices live in the fast trie. If you keep a deep bid book and mostly sell, store negated prices (`!price`) and use the buy-side ops.
 
-This repository sets `-C llvm-args=-x86-branches-within-32B-boundaries` in
-`.cargo/config.toml`. On CPUs affected by the Intel JCC erratum (Skylake-SP /
-Cascade Lake, e.g. Xeon Gold 62xx), conditional branches that touch a 32-byte
-code boundary disable the uop cache for their line; in our measurements this
-caused layout-dependent swings of up to ~80% on hot loops between otherwise
-identical builds. The flag pads branches so this cannot happen and made every
-hot path measurably faster and *stable* across rebuilds.
+Tested with a 200k-operation randomized differential test against `BTreeMap` (fixed seed) plus regression tests for past bugs. `cargo test`, and `cargo test --release` to cover the AVX-512 paths.
 
-Cargo config does **not** propagate to dependent crates — applications
-embedding glass-rs should set the same flag in their own build when deploying
-to affected CPUs.
+Docs: `cargo doc --open`, example in `examples/demo.rs`.
 
-## Going further
+## Tuning
 
-- `--features nightly`: `core::hint::likely`/`unlikely` on hot branches
-  (nightly toolchain only; no-op on stable).
-- For real layout-level gains, use PGO (`cargo-pgo`) with a recording of
-  your market-data feed; `-Z build-std` extends your flags to std.
+**JCC erratum (Skylake-SP / Cascade Lake):** `.cargo/config.toml` sets `-C llvm-args=-x86-branches-within-32B-boundaries`. On affected CPUs, branches touching a 32-byte boundary disable the uop cache for their line; we measured layout-dependent swings up to ~80% between identical builds. The flag pads branches, making hot paths faster *and* stable. Cargo config does not propagate to dependents, so set the flag in your own build when deploying to affected CPUs.
 
-## Deployment tuning (system level)
+Constants at the top of `src/lib.rs`: `MAX_SIZE` (4096, trie capacity before preemption), `HT_SIZE`/`HT_MAX_LOOKUP_LEN` (cache-table geometry, paper's J), `ARENA_CAPACITY`/`LEAF_ARENA_CAPACITY` (pre-allocation). `BITS_PER_LEVEL` is not freely tunable; masks and shifts assume 6.
 
-For latency-critical deployment on a machine like the Xeon Gold 62xx this was
-tuned on, the following complement the in-crate optimizations:
+Going further:
 
-- **CPU pinning + `performance` governor** — pin the market-data thread
-  (`taskset`/`isolcpus`) and disable frequency scaling; Glass is
-  single-threaded by design.
-- **Transparent Huge Pages** — the arenas span several MB; 2MB pages cut dTLB
-  pressure on random access (`madvise` THP mode is a good default).
-- **L3 partitioning (`cat_l3`/resctrl)** — the hot trie is designed to sit in
-  cache; dedicating L3 ways to the order-book process protects it from noisy
-  neighbors.
-
-Instruction-set notes from tuning on this CPU: hardware `popcnt` dispatch is
-worth ~10-15% on `remove_by_index` (rustc does not emit it on the baseline
-target); 512-bit leaf reductions beat a 256-bit AVX-512VL variant by ~17% on
-deep estimation sweeps (the "heavy license" downclock concern does not apply
-to this bursty usage); `buy_shares` prefetches the next leaf with intent to
-write (`prefetchw`). `bsf`/`bsr` vs `tzcnt`/`lzcnt` makes no measurable
-difference on Intel cores for the non-zero masks used here.
-
-## Configuration
-
-Constants at the top of `src/lib.rs`:
-
-- `BITS_PER_LEVEL` (6): radix width. Not freely tunable — masks and shifts
-  assume 6.
-- `MAX_SIZE` (4096): trie capacity before preemption kicks in.
-- `HT_SIZE` (4096) / `HT_MAX_LOOKUP_LEN` (5): cache-table geometry (paper's J).
-- `ARENA_CAPACITY` / `LEAF_ARENA_CAPACITY`: initial node pre-allocation.
-
-## Benchmarks
-
-Run on an **Intel Xeon Gold 6230 @ 2.10GHz** (Cascade Lake: AVX-512F/DQ, BMI2)
-with `cargo bench`. Bulk operations perform 1,000,000 operations against a book
-of ~1,500 price levels with sequential/local keys; nanoseconds per operation.
-Absolute numbers vary with machine load — the glass/BTreeMap ratio within a
-run is the stable signal.
-
-All rows below come from a single run pinned to an idle core (`taskset`,
-HT sibling also idle), built with the JCC mitigation flag (see below) —
-which also speeds up the BTreeMap baseline, so these ratios are honest.
-
-| Operation                         | Glass (ns/op) | BTreeMap (ns/op) | Speedup   |
-|-----------------------------------|---------------|------------------|-----------|
-| Insert                            | 4.09          | 50.41            | 12.3x     |
-| Get (existing)                    | 2.40          | 43.83            | 18.3x     |
-| Get (non-existing)                | 2.36          | 43.85            | 18.6x     |
-| Remove (incl. insert)*            | 5.02          | 51.07            | 10.2x     |
-| Min                               | 2.88          | 2.48             | 0.9x      |
-| Max                               | 3.68          | 3.16             | 0.9x      |
-| **Top 25 Levels (snapshot)**      | **29.8**      | **46.5**         | **1.6x**  |
-| Compute Buy Cost (1k shares)      | 8.16          | 6.30             | 0.8x      |
-| Compute Sell Cost (1k shares)     | 10.34         | 10.55            | ~parity   |
-| **Buy Shares (1k shares)**        | **577**       | **9,382**        | **16.3x** |
-| **Sell Shares (1k shares)**       | **703**       | **9,606**        | **13.7x** |
-| Compute Buy Cost (500k, deep)     | 358           | 2,006            | 5.6x      |
-| Compute Sell Cost (500k, deep)    | 334           | 2,037            | 6.1x      |
-| **Buy Shares (500k, deep)**       | **2,519**     | **31,063**       | **12.3x** |
-| **Sell Shares (500k, deep)**      | **2,519**     | **59,868**       | **23.8x** |
-
-\* The remove benchmark re-inserts 1M keys per iteration; remove alone is
-≈0.9 ns/op after subtracting the insert cost.
-
-The *deep sweep* benchmarks execute/estimate a 500,000-share order spanning
-~24 leaves (≈1,500 price levels), which is where whole-leaf vectorized
-consumption dominates per-level tree walks.
+- `--features nightly`: `likely`/`unlikely` hints on hot branches (no-op on stable).
+- PGO (`cargo-pgo`) with a recording of your feed; `-Z build-std` extends flags to std.
+- Deployment: pin the thread + `performance` governor, THP (`madvise`) for the multi-MB arenas, L3 partitioning (resctrl) to protect the hot trie from noisy neighbors.
 
 ## Reference
 
