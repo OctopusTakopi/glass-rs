@@ -38,6 +38,7 @@
 //!   runtime; portable fallbacks are used elsewhere, and the crate builds on
 //!   any architecture.
 #![warn(missing_docs)]
+#![cfg_attr(feature = "nightly", feature(likely_unlikely))]
 
 use ahash::AHashMap as HashMap;
 #[cfg(target_arch = "x86_64")]
@@ -53,6 +54,21 @@ const HT_SIZE: usize = 4096;
 const ARENA_CAPACITY: usize = 16384;
 const LEAF_ARENA_CAPACITY: usize = 4096;
 const HT_MAX_LOOKUP_LEN: usize = 5;
+
+// Branch-probability hints: real on nightly (feature = "nightly"), identity
+// on stable so the call sites read the same either way.
+#[cfg(feature = "nightly")]
+use core::hint::{likely, unlikely};
+#[cfg(not(feature = "nightly"))]
+#[inline(always)]
+fn likely(b: bool) -> bool {
+    b
+}
+#[cfg(not(feature = "nightly"))]
+#[inline(always)]
+fn unlikely(b: bool) -> bool {
+    b
+}
 
 // Tri-state answers of the bounded hash-table probe (paper §5.2), encoded as
 // sentinels so the hot path stays a plain u32 compare. Arena indices can
@@ -612,6 +628,9 @@ impl Glass {
         let mut curr = heads[h];
         let mut lookups = 0;
         while curr != u32::MAX && lookups < HT_MAX_LOOKUP_LEN {
+            // Note: an unchecked index here was measured no faster under the
+            // JCC-mitigated build (the check's branch predicts perfectly) —
+            // keep the safe indexing.
             let leaf = &self.leaf_arena[curr as usize];
             if leaf.ht_k == partial_key {
                 return curr;
@@ -647,9 +666,10 @@ impl Glass {
     #[inline(always)]
     fn find_leaf(&self, partial: u32) -> Option<u32> {
         let r = self.ht_lookup(partial);
-        if r < HT_UNKNOWN {
+        if likely(r < HT_UNKNOWN) {
             Some(r)
-        } else if r == HT_ABSENT {
+        } else if likely(r == HT_ABSENT) {
+            // "don't know" (a chain past the probe bound) is ~1e-7 (paper §5.3)
             None
         } else {
             self.trie_find_leaf(partial)
@@ -746,7 +766,7 @@ impl Glass {
     /// the level. Amortized O(1) with sequential locality.
     #[inline(always)]
     pub fn insert(&mut self, key: u32, value: u64) {
-        if value == 0 {
+        if unlikely(value == 0) {
             self.remove(key);
             return;
         }
@@ -832,7 +852,7 @@ impl Glass {
             match self.glass_get_mut(key) {
                 Some(mut_ref) => {
                     f(mut_ref);
-                    if *mut_ref != 0 {
+                    if likely(*mut_ref != 0) {
                         return true;
                     }
                     // Restore occupancy so glass_remove can find and unlink
@@ -889,7 +909,7 @@ impl Glass {
 
     #[inline(always)]
     fn check_bounds_and_thres(&self, key: u32) -> bool {
-        if !self.preempt_bounds_valid.get() {
+        if unlikely(!self.preempt_bounds_valid.get()) {
             self.update_preempt_bounds();
         }
         key < self.thres.get()

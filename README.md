@@ -150,6 +150,21 @@ Cargo config does **not** propagate to dependent crates — applications
 embedding glass-rs should set the same flag in their own build when deploying
 to affected CPUs.
 
+## Going further: nightly hints, PGO
+
+- The `nightly` cargo feature enables `core::hint::likely`/`unlikely` on the
+  hot routing branches (HT probe answer, tier routing, zero-value paths).
+  The annotations are semantically accurate; measured effect under the JCC
+  mitigation ranged from neutral to a few percent depending on resulting
+  code layout — do not expect a guaranteed win.
+- For reliable layout-level gains, use **profile-guided optimization**
+  (`cargo-pgo`, or `-C profile-generate`/`-C profile-use`) with a recording
+  of your real market-data feed: PGO derives branch weights and block
+  placement globally from actual behavior, which subsumes hand-placed hints.
+- `-Z build-std` (nightly cargo) additionally recompiles std with your
+  target flags so the overflow tier's hash map and allocator paths get the
+  same treatment.
+
 ## Deployment tuning (system level)
 
 For latency-critical deployment on a machine like the Xeon Gold 62xx this was

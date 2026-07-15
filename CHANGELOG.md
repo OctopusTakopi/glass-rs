@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `nightly` cargo feature: `core::hint::likely`/`unlikely` annotations on
+  the hot routing branches (no-op shims on stable). Measured neutral to
+  slightly positive under the JCC-mitigated build; README documents PGO as
+  the principled route to layout-level gains.
+
 - `top_levels(n, &mut buf)`: allocation-free best-N snapshot for imbalance
   computation; ~1.5x faster than `BTreeMap` at depth 25, with AVX-512
   `vpcompressq` whole-leaf extraction (occupancy bitmap as lane mask) for

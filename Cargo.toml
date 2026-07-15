@@ -12,6 +12,11 @@ edition = "2024"
 rust-version = "1.89"
 exclude = [".idea/", ".github/"]
 
+[features]
+# Opt-in branch-probability hints (core::hint::likely/unlikely) on the hot
+# routing branches. Requires a nightly toolchain; a no-op on stable builds.
+nightly = []
+
 [dependencies]
 ahash = "0.8"
 
