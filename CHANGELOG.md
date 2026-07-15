@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Sell side**: `sell_shares` and `compute_sell_cost` — market-sell
+  execution/estimation from the highest price downward (bid-book mirror of
+  the buy path), with whole-leaf vectorized consumption and overflow-tier
+  draining; deep-sweep benchmarks included.
+- **BTreeMap-style API**: `contains_key`, `get_key_value`,
+  `first_key_value`/`last_key_value`, `pop_first`/`pop_last`,
+  `keys`/`values`, `range` (full `RangeBounds`), `retain`, `split_off`,
+  owning `IntoIterator`, and `next_level`/`prev_level` (the paper's
+  next/prev). `get_mut`/`entry` are intentionally omitted; `update_value`
+  is the invariant-safe in-place adjust.
+- Dev-dependency bumps: criterion 0.8, rand 0.10.
+
 ## 0.1.0 — 2026-07-15
 
 ### Fixed (audited against arXiv:2506.13991)

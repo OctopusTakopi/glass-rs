@@ -274,6 +274,257 @@ impl Glass {
         }
     }
 
+    // Iterator positioned at the first level with price >= start.
+    fn iter_at(&self, start: u32) -> Iter<'_> {
+        self.ensure_sorted_preempt_keys();
+
+        let (leaf_idx, mask) = if self.glass_size() > 0 && start <= self.max_key.get() {
+            if start <= self.min_key.get() {
+                let li = self.min_leaf.get();
+                (li, self.leaf_arena[li as usize].mask)
+            } else {
+                let partial = start >> BITS_PER_LEVEL;
+                let slot = (start & 0x3F) as usize;
+                if let Some(li) = self.find_leaf(partial) {
+                    // Keep only bits >= slot in the starting leaf.
+                    let m = self.leaf_arena[li as usize].mask & (u64::MAX << slot);
+                    if m != 0 {
+                        (li, m)
+                    } else {
+                        let nl = self.leaf_arena[li as usize].next_leaf;
+                        if nl != u32::MAX {
+                            (nl, self.leaf_arena[nl as usize].mask)
+                        } else {
+                            (u32::MAX, 0)
+                        }
+                    }
+                } else {
+                    let (_, nl) = self.find_neighbor_leaves(start);
+                    if nl != u32::MAX {
+                        (nl, self.leaf_arena[nl as usize].mask)
+                    } else {
+                        (u32::MAX, 0)
+                    }
+                }
+            }
+        } else {
+            (u32::MAX, 0)
+        };
+
+        let keys = unsafe { &*self.sorted_preempt_keys.get() };
+        let preempt_pos = keys.partition_point(|&k| k < start);
+
+        Iter {
+            glass: self,
+            leaf_idx,
+            mask,
+            preempt_pos,
+        }
+    }
+
+    /// Iterates the levels within `range` in ascending price order, like
+    /// [`BTreeMap::range`](std::collections::BTreeMap::range).
+    pub fn range<R: std::ops::RangeBounds<u32>>(&self, range: R) -> Range<'_> {
+        use std::ops::Bound::*;
+        let start = match range.start_bound() {
+            Unbounded => 0,
+            Included(&a) => a,
+            Excluded(&a) => match a.checked_add(1) {
+                Some(s) => s,
+                None => {
+                    return Range {
+                        inner: self.iter_at(u32::MAX),
+                        end: 0,
+                        done: true,
+                    };
+                }
+            },
+        };
+        let (end, empty) = match range.end_bound() {
+            Unbounded => (u32::MAX, false),
+            Included(&b) => (b, false),
+            Excluded(&b) => {
+                if b == 0 {
+                    (0, true)
+                } else {
+                    (b - 1, false)
+                }
+            }
+        };
+        let done = empty || start > end;
+        Range {
+            inner: self.iter_at(if done { u32::MAX } else { start }),
+            end,
+            done,
+        }
+    }
+
+    /// Returns the lowest level with price strictly greater than `key`
+    /// (the paper's `next` operation). O(1) with the linked leaf list when
+    /// the key's leaf exists.
+    pub fn next_level(&self, key: u32) -> Option<(u32, u64)> {
+        if let Some(r) = self.glass_next(key) {
+            return Some(r); // glass keys are the smallest: first hit wins
+        }
+        let preempt = unsafe { &*self.preempt.get() };
+        if preempt.is_empty() {
+            return None;
+        }
+        self.ensure_sorted_preempt_keys();
+        let keys = unsafe { &*self.sorted_preempt_keys.get() };
+        let pos = keys.partition_point(|&k| k <= key);
+        keys.get(pos).map(|&k| (k, *preempt.get(&k).unwrap()))
+    }
+
+    /// Returns the highest level with price strictly less than `key`
+    /// (the paper's `prev` operation).
+    pub fn prev_level(&self, key: u32) -> Option<(u32, u64)> {
+        // The overflow tier holds the highest prices: check it first.
+        let preempt = unsafe { &*self.preempt.get() };
+        if !preempt.is_empty() {
+            self.ensure_sorted_preempt_keys();
+            let keys = unsafe { &*self.sorted_preempt_keys.get() };
+            let pos = keys.partition_point(|&k| k < key);
+            if pos > 0 {
+                let k = keys[pos - 1];
+                return Some((k, *preempt.get(&k).unwrap()));
+            }
+        }
+        self.glass_prev(key)
+    }
+
+    fn glass_next(&self, key: u32) -> Option<(u32, u64)> {
+        if self.glass_size() == 0 || key >= self.max_key.get() {
+            return None;
+        }
+        if key < self.min_key.get() {
+            return self.glass_min();
+        }
+        let partial = key >> BITS_PER_LEVEL;
+        let slot = (key & 0x3F) as usize;
+        if let Some(li) = self.find_leaf(partial) {
+            let leaf = &self.leaf_arena[li as usize];
+            if let Some(s) = self.find_next_set_bit(leaf.mask, slot + 1) {
+                return Some(((leaf.ht_k << BITS_PER_LEVEL) | s as u32, leaf.values[s]));
+            }
+            let nl = leaf.next_leaf;
+            if nl != u32::MAX {
+                let n = &self.leaf_arena[nl as usize];
+                let s = self.tz64(n.mask);
+                return Some(((n.ht_k << BITS_PER_LEVEL) | s as u32, n.values[s]));
+            }
+            None
+        } else {
+            let (_, nl) = self.find_neighbor_leaves(key);
+            if nl != u32::MAX {
+                let n = &self.leaf_arena[nl as usize];
+                let s = self.tz64(n.mask);
+                return Some(((n.ht_k << BITS_PER_LEVEL) | s as u32, n.values[s]));
+            }
+            None
+        }
+    }
+
+    fn glass_prev(&self, key: u32) -> Option<(u32, u64)> {
+        if self.glass_size() == 0 || key <= self.min_key.get() {
+            return None;
+        }
+        if key > self.max_key.get() {
+            return self.glass_max();
+        }
+        let partial = key >> BITS_PER_LEVEL;
+        let slot = (key & 0x3F) as usize;
+        if let Some(li) = self.find_leaf(partial) {
+            let leaf = &self.leaf_arena[li as usize];
+            if let Some(s) = self.find_prev_set_bit(leaf.mask, slot) {
+                return Some(((leaf.ht_k << BITS_PER_LEVEL) | s as u32, leaf.values[s]));
+            }
+            let pl = leaf.prev_leaf;
+            if pl != u32::MAX {
+                let p = &self.leaf_arena[pl as usize];
+                let s = self.high_bit(p.mask);
+                return Some(((p.ht_k << BITS_PER_LEVEL) | s as u32, p.values[s]));
+            }
+            None
+        } else {
+            let (pl, _) = self.find_neighbor_leaves(key);
+            if pl != u32::MAX {
+                let p = &self.leaf_arena[pl as usize];
+                let s = self.high_bit(p.mask);
+                return Some(((p.ht_k << BITS_PER_LEVEL) | s as u32, p.values[s]));
+            }
+            None
+        }
+    }
+
+    /// Returns `true` if `key` holds a level.
+    pub fn contains_key(&self, key: u32) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Returns the `(price, quantity)` pair for `key`, if present.
+    pub fn get_key_value(&self, key: u32) -> Option<(u32, u64)> {
+        self.get(key).map(|v| (key, v))
+    }
+
+    /// Lowest level, like [`BTreeMap::first_key_value`](std::collections::BTreeMap::first_key_value).
+    pub fn first_key_value(&self) -> Option<(u32, u64)> {
+        self.min()
+    }
+
+    /// Highest level, like [`BTreeMap::last_key_value`](std::collections::BTreeMap::last_key_value).
+    pub fn last_key_value(&self) -> Option<(u32, u64)> {
+        self.max()
+    }
+
+    /// Removes and returns the lowest level.
+    pub fn pop_first(&mut self) -> Option<(u32, u64)> {
+        let (k, _) = self.min()?;
+        let v = self.remove(k)?;
+        Some((k, v))
+    }
+
+    /// Removes and returns the highest level.
+    pub fn pop_last(&mut self) -> Option<(u32, u64)> {
+        let (k, _) = self.max()?;
+        let v = self.remove(k)?;
+        Some((k, v))
+    }
+
+    /// Iterates prices in ascending order.
+    pub fn keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// Iterates quantities in ascending price order.
+    pub fn values(&self) -> impl Iterator<Item = u64> + '_ {
+        self.iter().map(|(_, v)| v)
+    }
+
+    /// Keeps only the levels for which `f` returns `true`.
+    pub fn retain(&mut self, mut f: impl FnMut(u32, u64) -> bool) {
+        let doomed: Vec<u32> = self
+            .iter()
+            .filter(|&(k, v)| !f(k, v))
+            .map(|(k, _)| k)
+            .collect();
+        for k in doomed {
+            self.remove(k);
+        }
+    }
+
+    /// Splits the book: `self` keeps levels below `key`, the returned glass
+    /// receives levels at or above `key`.
+    pub fn split_off(&mut self, key: u32) -> Glass {
+        let mut upper = Glass::new();
+        let moved: Vec<(u32, u64)> = self.range(key..).collect();
+        for (k, v) in moved {
+            self.remove(k);
+            upper.insert(k, v);
+        }
+        upper
+    }
+
     #[inline(always)]
     fn ensure_sorted_preempt_keys(&self) {
         if self.preempt_dirty.get() {
@@ -853,6 +1104,43 @@ impl Glass {
         } else {
             self.min_key.set(u32::MAX);
         }
+        self.detach_leaf_from_trie(leaf_idx, partial, n);
+    }
+
+    // Mirror of remove_min_leaf for the maximum leaf (sell-side consumption).
+    fn remove_max_leaf(&mut self, leaf_idx: u32, mask: u64) {
+        let n = self.popcnt64(mask);
+        let (partial, prev_l) = {
+            let leaf = &mut self.leaf_arena[leaf_idx as usize];
+            let p = leaf.ht_k;
+            let pl = leaf.prev_leaf;
+            leaf.mask = 0;
+            leaf.values = [0; NUM_CHILDREN];
+            (p, pl)
+        };
+
+        if prev_l != u32::MAX {
+            self.leaf_arena[prev_l as usize].next_leaf = u32::MAX;
+        } else {
+            self.min_leaf.set(u32::MAX);
+            self.min_key.set(u32::MAX);
+        }
+        self.max_leaf.set(prev_l);
+        if prev_l != u32::MAX {
+            let pleaf = &self.leaf_arena[prev_l as usize];
+            let slot = self.high_bit(pleaf.mask) as u32;
+            self.max_key.set((pleaf.ht_k << BITS_PER_LEVEL) | slot);
+        } else {
+            self.max_key.set(0);
+        }
+        self.detach_leaf_from_trie(leaf_idx, partial, n);
+    }
+
+    // Shared tail of whole-leaf removal: hash-table unlink, arena free,
+    // ancestor count decrements, empty-subtree pruning, and cached-path
+    // invalidation. The caller has already emptied the leaf and fixed the
+    // leaf list and min/max bookkeeping.
+    fn detach_leaf_from_trie(&mut self, leaf_idx: u32, partial: u32, n: u32) {
         self.ht_remove(leaf_idx);
         self.leaf_free_list.push(leaf_idx);
 
@@ -962,6 +1250,177 @@ impl Glass {
             }
         }
         total_cost
+    }
+
+    /// Executes a market sell: consumes `shares_to_sell` from the *highest*
+    /// levels downward, deleting depleted levels, and returns the total
+    /// proceeds (saturating). The mirror of [`Glass::buy_shares`] — use it
+    /// when this glass holds the bid side of a book.
+    ///
+    /// The overflow tier holds the highest prices, so it is drained first
+    /// (sorted, from the top), then trie leaves are consumed whole from the
+    /// max leaf backward. Note the preemption design keeps the *lowest* keys
+    /// in the fast trie; for a sell-heavy workload against a book deeper than
+    /// 4096 levels, consider storing negated prices (`!price`) and using the
+    /// buy-side operations instead, so the best bids live in the trie.
+    pub fn sell_shares(&mut self, mut shares_to_sell: u64) -> u64 {
+        let mut total_proceeds = 0u64;
+
+        // 1. Overflow tier, highest price first.
+        if shares_to_sell > 0 && !unsafe { (*self.preempt.get()).is_empty() } {
+            self.ensure_sorted_preempt_keys();
+            unsafe {
+                let preempt = &mut *self.preempt.get();
+                let keys = &mut *self.sorted_preempt_keys.get();
+                while shares_to_sell > 0 {
+                    let Some(&k) = keys.last() else { break };
+                    let avail = *preempt.get(&k).unwrap();
+                    if avail <= shares_to_sell {
+                        total_proceeds =
+                            total_proceeds.saturating_add((k as u64).saturating_mul(avail));
+                        shares_to_sell -= avail;
+                        preempt.remove(&k);
+                        keys.pop();
+                    } else {
+                        total_proceeds = total_proceeds
+                            .saturating_add((k as u64).saturating_mul(shares_to_sell));
+                        *preempt.get_mut(&k).unwrap() -= shares_to_sell;
+                        shares_to_sell = 0;
+                    }
+                }
+                // The drained sorted list stays exact, so set bounds exactly.
+                if keys.is_empty() {
+                    self.thres.set(u32::MAX);
+                    self.preempt_min.set(u32::MAX);
+                    self.preempt_max.set(0);
+                } else {
+                    let new_min = keys[0];
+                    self.thres.set(new_min);
+                    self.preempt_min.set(new_min);
+                    self.preempt_max.set(*keys.last().unwrap());
+                }
+                self.preempt_bounds_valid.set(true);
+            }
+        }
+
+        // 2. Glass tier from the max leaf downward.
+        while shares_to_sell > 0 && self.glass_size() > 0 {
+            let leaf_idx = self.max_leaf.get();
+            let (mask, base, prev_leaf) = {
+                let leaf = &self.leaf_arena[leaf_idx as usize];
+                (
+                    leaf.mask,
+                    (leaf.ht_k as u64) << BITS_PER_LEVEL,
+                    leaf.prev_leaf,
+                )
+            };
+            // The predecessor leaf will be consumed (written) next.
+            self.prefetch_leaf_w(prev_leaf);
+            let (qty_total, weighted) = self.leaf_sums(&self.leaf_arena[leaf_idx as usize].values);
+
+            if qty_total <= shares_to_sell {
+                // Consume the entire leaf.
+                total_proceeds = total_proceeds
+                    .saturating_add(base.saturating_mul(qty_total))
+                    .saturating_add(weighted);
+                shares_to_sell -= qty_total;
+                self.remove_max_leaf(leaf_idx, mask);
+            } else {
+                // Partial: walk set bits from the highest slot down.
+                let leaf = &mut self.leaf_arena[leaf_idx as usize];
+                let mut consumed_slots = 0u32;
+                while shares_to_sell > 0 {
+                    // plain leading_zeros: self is mutably borrowed via `leaf`
+                    let slot = 63 - leaf.mask.leading_zeros() as usize;
+                    let price = base | slot as u64;
+                    let qty = leaf.values[slot];
+                    if qty <= shares_to_sell {
+                        total_proceeds = total_proceeds.saturating_add(price.saturating_mul(qty));
+                        shares_to_sell -= qty;
+                        leaf.values[slot] = 0;
+                        leaf.mask &= !(1u64 << slot);
+                        consumed_slots += 1;
+                    } else {
+                        total_proceeds =
+                            total_proceeds.saturating_add(price.saturating_mul(shares_to_sell));
+                        leaf.values[slot] -= shares_to_sell;
+                        shares_to_sell = 0;
+                    }
+                }
+                let partial = (base >> BITS_PER_LEVEL) as u32;
+                let new_max_slot = self.high_bit(self.leaf_arena[leaf_idx as usize].mask) as u32;
+                self.max_key.set((base as u32) | new_max_slot);
+                if consumed_slots > 0 {
+                    self.decrement_ancestor_counts(partial, consumed_slots);
+                }
+                break;
+            }
+        }
+        total_proceeds
+    }
+
+    /// Estimates the proceeds of selling `target_shares` into the highest
+    /// levels downward without mutating the book (saturating arithmetic).
+    /// The mirror of [`Glass::compute_buy_cost`].
+    pub fn compute_sell_cost(&self, mut target_shares: u64) -> u64 {
+        let mut total_proceeds = 0u64;
+
+        // Overflow tier first: it holds the highest prices.
+        {
+            let preempt = unsafe { &*self.preempt.get() };
+            if !preempt.is_empty() {
+                self.ensure_sorted_preempt_keys();
+                let keys = unsafe { &*self.sorted_preempt_keys.get() };
+                for &k in keys.iter().rev() {
+                    if target_shares == 0 {
+                        return total_proceeds;
+                    }
+                    let avail = *preempt.get(&k).unwrap();
+                    let take = avail.min(target_shares);
+                    total_proceeds = total_proceeds.saturating_add((k as u64).saturating_mul(take));
+                    target_shares -= take;
+                }
+            }
+        }
+
+        // Glass tier from the max leaf downward. Same adaptive shape as the
+        // buy estimate: first leaf per-slot, deeper leaves vectorized.
+        let mut curr_leaf_idx = self.max_leaf.get();
+        let mut first = true;
+        while curr_leaf_idx != u32::MAX && target_shares > 0 {
+            let leaf = &self.leaf_arena[curr_leaf_idx as usize];
+            let base = (leaf.ht_k as u64) << BITS_PER_LEVEL;
+
+            if !first {
+                self.prefetch_leaf(leaf.prev_leaf);
+                let (qty_total, weighted) = self.leaf_sums(&leaf.values);
+                if qty_total <= target_shares {
+                    total_proceeds = total_proceeds
+                        .saturating_add(base.saturating_mul(qty_total))
+                        .saturating_add(weighted);
+                    target_shares -= qty_total;
+                    curr_leaf_idx = leaf.prev_leaf;
+                    continue;
+                }
+            }
+            first = false;
+
+            let mut mask = leaf.mask;
+            while mask != 0 {
+                let slot = self.high_bit(mask);
+                let price = base | slot as u64;
+                let qty = leaf.values[slot];
+                let take = qty.min(target_shares);
+                total_proceeds = total_proceeds.saturating_add(price.saturating_mul(take));
+                target_shares -= take;
+                if target_shares == 0 {
+                    return total_proceeds;
+                }
+                mask &= !(1u64 << slot);
+            }
+            curr_leaf_idx = leaf.prev_leaf;
+        }
+        total_proceeds
     }
 
     #[inline(always)]
@@ -1538,6 +1997,51 @@ impl<'a> IntoIterator for &'a Glass {
 
     fn into_iter(self) -> Iter<'a> {
         self.iter()
+    }
+}
+
+/// Ascending iterator over the levels within a price range; see
+/// [`Glass::range`].
+pub struct Range<'a> {
+    inner: Iter<'a>,
+    end: u32, // inclusive upper bound
+    done: bool,
+}
+
+impl Iterator for Range<'_> {
+    type Item = (u32, u64);
+
+    fn next(&mut self) -> Option<(u32, u64)> {
+        if self.done {
+            return None;
+        }
+        match self.inner.next() {
+            Some((k, v)) if k <= self.end => Some((k, v)),
+            _ => {
+                self.done = true;
+                None
+            }
+        }
+    }
+}
+
+/// Owning iterator draining levels in ascending price order.
+pub struct IntoIter(Glass);
+
+impl Iterator for IntoIter {
+    type Item = (u32, u64);
+
+    fn next(&mut self) -> Option<(u32, u64)> {
+        self.0.pop_first()
+    }
+}
+
+impl IntoIterator for Glass {
+    type Item = (u32, u64);
+    type IntoIter = IntoIter;
+
+    fn into_iter(self) -> IntoIter {
+        IntoIter(self)
     }
 }
 

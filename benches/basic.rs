@@ -208,6 +208,91 @@ fn bench_buy_shares(c: &mut Criterion) {
     });
 }
 
+fn compute_sell_cost_btree(map: &BTreeMap<u32, u64>, target: u64) -> u64 {
+    let mut remaining = target;
+    let mut proceeds = 0u64;
+    for (&price, &quantity) in map.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(quantity);
+        proceeds += price as u64 * take;
+        remaining -= take;
+    }
+    proceeds
+}
+
+fn sell_shares_btree(map: &mut BTreeMap<u32, u64>, mut shares: u64) -> u64 {
+    let mut proceeds = 0u64;
+    while shares > 0 {
+        let Some((&price, &avail)) = map.iter().next_back() else {
+            break;
+        };
+        if avail <= shares {
+            proceeds += (price as u64) * avail;
+            shares -= avail;
+            map.remove(&price);
+        } else {
+            proceeds += (price as u64) * shares;
+            *map.get_mut(&price).unwrap() -= shares;
+            shares = 0;
+        }
+    }
+    proceeds
+}
+
+fn bench_sell(c: &mut Criterion) {
+    let keys = generate_random_keys(N);
+    let values = generate_random_values(N);
+    let target = 1000u64;
+
+    let mut glass = Glass::new();
+    for i in 0..N {
+        glass.insert(keys[i], values[i]);
+    }
+    c.bench_function("compute_sell_cost", |b| {
+        b.iter(|| black_box(glass.compute_sell_cost(black_box(target))))
+    });
+
+    let mut map = BTreeMap::new();
+    for i in 0..N {
+        map.insert(keys[i], values[i]);
+    }
+    c.bench_function("compute_sell_cost_btree", |b| {
+        b.iter(|| black_box(compute_sell_cost_btree(&map, black_box(target))))
+    });
+
+    c.bench_function("sell_shares", |b| {
+        b.iter_with_setup(
+            || {
+                let mut glass = Glass::new();
+                for i in 0..N {
+                    glass.insert(keys[i], values[i]);
+                }
+                glass
+            },
+            |mut glass| {
+                black_box(glass.sell_shares(black_box(target)));
+            },
+        )
+    });
+
+    c.bench_function("sell_shares_btree", |b| {
+        b.iter_with_setup(
+            || {
+                let mut map = BTreeMap::new();
+                for i in 0..N {
+                    map.insert(keys[i], values[i]);
+                }
+                map
+            },
+            |mut map| {
+                black_box(sell_shares_btree(&mut map, black_box(target)));
+            },
+        )
+    });
+}
+
 /// Deep sweeps spanning many leaves: exercises whole-leaf (vectorized)
 /// consumption instead of the first-leaf partial path.
 fn bench_deep_sweep(c: &mut Criterion) {
@@ -257,6 +342,42 @@ fn bench_deep_sweep(c: &mut Criterion) {
             },
             |mut map| {
                 black_box(buy_shares_btree(&mut map, black_box(deep_target)));
+            },
+        )
+    });
+
+    c.bench_function("compute_sell_cost_deep", |b| {
+        b.iter(|| black_box(glass.compute_sell_cost(black_box(deep_target))))
+    });
+    c.bench_function("compute_sell_cost_deep_btree", |b| {
+        b.iter(|| black_box(compute_sell_cost_btree(&map, black_box(deep_target))))
+    });
+
+    c.bench_function("sell_shares_deep", |b| {
+        b.iter_with_setup(
+            || {
+                let mut glass = Glass::new();
+                for i in 0..N {
+                    glass.insert(keys[i], values[i]);
+                }
+                glass
+            },
+            |mut glass| {
+                black_box(glass.sell_shares(black_box(deep_target)));
+            },
+        )
+    });
+    c.bench_function("sell_shares_deep_btree", |b| {
+        b.iter_with_setup(
+            || {
+                let mut map = BTreeMap::new();
+                for i in 0..N {
+                    map.insert(keys[i], values[i]);
+                }
+                map
+            },
+            |mut map| {
+                black_box(sell_shares_btree(&mut map, black_box(deep_target)));
             },
         )
     });
@@ -483,7 +604,8 @@ criterion_group! {
     name = benches;
     config = Criterion::default().measurement_time(Duration::from_secs(6));
     targets = bench_insert, bench_get, bench_remove, bench_min_max, bench_compute_buy_cost,
-        bench_buy_shares, bench_deep_sweep, bench_remove_by_index, bench_remove_by_index_btree
+        bench_buy_shares, bench_sell, bench_deep_sweep, bench_remove_by_index,
+        bench_remove_by_index_btree
 }
 
 criterion_main!(benches);

@@ -98,10 +98,38 @@ fn main() {
 }
 ```
 
-Also available: `update_value` (in-place adjust; reaching zero deletes the
-level), `remove_by_index` (k-th smallest), `clear` (reset, keeps allocations),
-`Extend`/`FromIterator`, and `Debug`. See `cargo doc --open` and
-`examples/demo.rs`.
+### API surface
+
+The map API mirrors `std::collections::BTreeMap` where it makes sense:
+`get`, `get_key_value`, `contains_key`, `insert`, `remove`, `len`,
+`is_empty`, `clear`, `iter`, `keys`, `values`, `range`, `first_key_value`,
+`last_key_value`, `pop_first`, `pop_last`, `retain`, `split_off`,
+`Extend`/`FromIterator`/`IntoIterator` (borrowed and owning), and `Debug`.
+
+Deliberately **not** provided: `get_mut`/`values_mut`/`entry` — a raw
+`&mut u64` would let callers write 0 and corrupt the occupancy invariant.
+Use `update_value` (closure-based in-place adjust; reaching zero deletes the
+level, per the paper's `adjust`).
+
+Order-book operations beyond the map API:
+
+- `buy_shares` / `compute_buy_cost` — market-order execution/estimation from
+  the *lowest* price upward (ask book).
+- `sell_shares` / `compute_sell_cost` — the mirror: execution/estimation from
+  the *highest* price downward (bid book). The overflow tier holds the
+  highest prices and is drained first; trie leaves are then consumed whole
+  from the max leaf backward with the same vectorized sums.
+- `next_level` / `prev_level` — successor/predecessor level (the paper's
+  `next`/`prev`), O(1) via the linked leaf list when the neighbor shares a
+  leaf.
+- `remove_by_index` — k-th smallest level, via per-subtree counts.
+
+Note for deep bid books (> 4096 levels): the preemption tier keeps the
+*lowest* prices in the fast trie. If your workload is sell-heavy against a
+very deep book, store negated prices (`!price`) and use the buy-side
+operations so the best bids stay in the trie.
+
+See `cargo doc --open` and `examples/demo.rs`.
 
 ## Build configuration for Skylake/Cascade Lake (JCC erratum)
 
@@ -169,6 +197,10 @@ run is the stable signal.
 | **Buy Shares (1k shares)**       | **773**       | **9,971**        | **12.9x** |
 | **Compute Buy Cost (500k, deep)**| **297**       | **2,066**        | **7.0x**  |
 | **Buy Shares (500k, deep)**      | **2,495**     | **31,558**       | **12.6x** |
+| Compute Sell Cost (1k shares)    | 8.67          | 9.52             | 1.1x      |
+| **Sell Shares (1k shares)**      | **595**       | **9,568**        | **16.1x** |
+| Compute Sell Cost (500k, deep)   | 290           | 2,087            | 7.2x      |
+| **Sell Shares (500k, deep)**     | **2,642**     | **60,611**       | **22.9x** |
 
 \* The remove benchmark re-inserts 1M keys per iteration; remove alone is
 ≈0.9 ns/op after subtracting the insert cost. All rows built with the JCC

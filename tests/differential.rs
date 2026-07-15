@@ -47,6 +47,38 @@ fn oracle_buy_shares(m: &mut BTreeMap<u32, u64>, mut shares: u64) -> u64 {
     cost
 }
 
+fn oracle_sell_cost(m: &BTreeMap<u32, u64>, mut target: u64) -> u64 {
+    let mut proceeds = 0u64;
+    for (&p, &q) in m.iter().rev() {
+        if target == 0 {
+            break;
+        }
+        let take = q.min(target);
+        proceeds += p as u64 * take;
+        target -= take;
+    }
+    proceeds
+}
+
+fn oracle_sell_shares(m: &mut BTreeMap<u32, u64>, mut shares: u64) -> u64 {
+    let mut proceeds = 0u64;
+    while shares > 0 {
+        let Some((&p, &q)) = m.iter().next_back() else {
+            break;
+        };
+        if q <= shares {
+            proceeds += p as u64 * q;
+            shares -= q;
+            m.remove(&p);
+        } else {
+            proceeds += p as u64 * shares;
+            *m.get_mut(&p).unwrap() -= shares;
+            shares = 0;
+        }
+    }
+    proceeds
+}
+
 /// Deterministic xorshift so failures are reproducible.
 struct Rng(u64);
 impl Rng {
@@ -218,6 +250,144 @@ fn clear_resets_routing() {
     );
 }
 
+/// Sells must drain the overflow tier (highest prices) before the trie, and
+/// stay exact across the tier boundary.
+#[test]
+fn sell_across_tiers() {
+    let mut glass = Glass::new();
+    let mut oracle = BTreeMap::new();
+    // 6000 levels: 4096 lowest in the trie, the rest preempted.
+    for i in 0..6000u32 {
+        glass.insert(i * 2 + 1, (i as u64 % 9) + 1);
+        oracle.insert(i * 2 + 1, (i as u64 % 9) + 1);
+    }
+    assert_eq!(glass.len(), 6000);
+
+    // Small sell: hits only the overflow tier.
+    assert_eq!(glass.sell_shares(37), oracle_sell_shares(&mut oracle, 37));
+    assert_eq!(
+        glass.max(),
+        oracle.iter().next_back().map(|(&k, &v)| (k, v))
+    );
+
+    // Estimation must agree at every depth including across the boundary.
+    for t in [10u64, 5_000, 12_000, 40_000, u64::MAX] {
+        assert_eq!(
+            glass.compute_sell_cost(t),
+            oracle_sell_cost(&oracle, t),
+            "compute_sell_cost({t})"
+        );
+    }
+
+    // Deep sell crossing from the map tier into the trie.
+    assert_eq!(
+        glass.sell_shares(20_000),
+        oracle_sell_shares(&mut oracle, 20_000)
+    );
+    let keys: Vec<u32> = oracle.keys().copied().collect();
+    check_all(&glass, &oracle, &keys, "after deep sell");
+
+    // Interleave sells and buys until empty.
+    loop {
+        let g = glass.sell_shares(700);
+        let o = oracle_sell_shares(&mut oracle, 700);
+        assert_eq!(g, o, "interleaved sell");
+        let g = glass.buy_shares(300);
+        let o = oracle_buy_shares(&mut oracle, 300);
+        assert_eq!(g, o, "interleaved buy");
+        if oracle.is_empty() {
+            break;
+        }
+    }
+    assert!(glass.is_empty());
+}
+
+/// BTreeMap-style conveniences behave like their std counterparts.
+#[test]
+fn btreemap_like_api() {
+    let mut glass = Glass::new();
+    let mut oracle = BTreeMap::new();
+    for i in 0..500u32 {
+        glass.insert(i * 7 + 3, i as u64 + 1);
+        oracle.insert(i * 7 + 3, i as u64 + 1);
+    }
+
+    assert!(glass.contains_key(3));
+    assert!(!glass.contains_key(4));
+    assert_eq!(glass.get_key_value(10), Some((10, 2)));
+    assert_eq!(glass.first_key_value(), Some((3, 1)));
+    assert_eq!(glass.last_key_value(), Some((499 * 7 + 3, 500)));
+
+    // next/prev navigation, including edges.
+    assert_eq!(glass.next_level(0), Some((3, 1)));
+    assert_eq!(glass.next_level(3), Some((10, 2)));
+    assert_eq!(glass.next_level(u32::MAX), None);
+    assert_eq!(glass.prev_level(3), None);
+    assert_eq!(glass.prev_level(10), Some((3, 1)));
+    assert_eq!(glass.prev_level(u32::MAX), Some((499 * 7 + 3, 500)));
+
+    // keys/values ordering.
+    let ks: Vec<u32> = glass.keys().take(3).collect();
+    assert_eq!(ks, vec![3, 10, 17]);
+    let vs: Vec<u64> = glass.values().take(3).collect();
+    assert_eq!(vs, vec![1, 2, 3]);
+
+    // range with all bound shapes.
+    use std::ops::Bound::{Excluded, Included};
+    let cases: Vec<(std::ops::Bound<u32>, std::ops::Bound<u32>)> = vec![
+        (Included(10), Excluded(100)),
+        (Excluded(10), Included(100)),
+        (Included(0), Included(u32::MAX)),
+        (Included(101), Excluded(101)),
+        (Excluded(u32::MAX), std::ops::Bound::Unbounded),
+    ];
+    for (lo, hi) in cases {
+        let mine: Vec<(u32, u64)> = glass.range((lo, hi)).collect();
+        let theirs: Vec<(u32, u64)> = oracle.range((lo, hi)).map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(mine, theirs, "range({lo:?}, {hi:?})");
+    }
+
+    // pop_first / pop_last.
+    assert_eq!(glass.pop_first(), oracle.pop_first());
+    assert_eq!(glass.pop_last(), oracle.pop_last());
+
+    // retain: keep even quantities only.
+    glass.retain(|_, v| v % 2 == 0);
+    oracle.retain(|_, v| *v % 2 == 0);
+    assert_eq!(glass.len(), oracle.len());
+    let mine: Vec<(u32, u64)> = glass.iter().collect();
+    let theirs: Vec<(u32, u64)> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+    assert_eq!(mine, theirs, "after retain");
+
+    // split_off.
+    let split_key = 1000;
+    let upper = glass.split_off(split_key);
+    let upper_oracle = oracle.split_off(&split_key);
+    assert_eq!(
+        upper.iter().collect::<Vec<_>>(),
+        upper_oracle
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .collect::<Vec<_>>(),
+        "split_off upper"
+    );
+    assert_eq!(
+        glass.iter().collect::<Vec<_>>(),
+        oracle.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+        "split_off lower"
+    );
+
+    // owned IntoIterator drains ascending.
+    let drained: Vec<(u32, u64)> = upper.into_iter().collect();
+    assert_eq!(
+        drained,
+        upper_oracle
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// FromIterator/Extend round-trip through iter().
 #[test]
 fn from_iterator_round_trip() {
@@ -296,20 +466,76 @@ fn random_ops_match_btreemap() {
                     );
                 }
             }
-            94..=96 => {
+            94 => {
                 let target = rng.below(5000);
                 assert_eq!(
                     glass.compute_buy_cost(target),
                     oracle_buy_cost(&oracle, target),
                     "compute_buy_cost({target}) at step {step}"
                 );
+                assert_eq!(
+                    glass.compute_sell_cost(target),
+                    oracle_sell_cost(&oracle, target),
+                    "compute_sell_cost({target}) at step {step}"
+                );
             }
-            _ => {
+            95 => {
                 let shares = rng.below(3000);
                 assert_eq!(
                     glass.buy_shares(shares),
                     oracle_buy_shares(&mut oracle, shares),
                     "buy_shares({shares}) at step {step}"
+                );
+            }
+            96 => {
+                let shares = rng.below(3000);
+                assert_eq!(
+                    glass.sell_shares(shares),
+                    oracle_sell_shares(&mut oracle, shares),
+                    "sell_shares({shares}) at step {step}"
+                );
+            }
+            97 => {
+                use std::ops::Bound::{Excluded, Unbounded};
+                assert_eq!(
+                    glass.next_level(key),
+                    oracle
+                        .range((Excluded(key), Unbounded))
+                        .next()
+                        .map(|(&k, &v)| (k, v)),
+                    "next_level({key}) at step {step}"
+                );
+                assert_eq!(
+                    glass.prev_level(key),
+                    oracle.range(..key).next_back().map(|(&k, &v)| (k, v)),
+                    "prev_level({key}) at step {step}"
+                );
+            }
+            98 => {
+                assert_eq!(
+                    glass.pop_first(),
+                    oracle.pop_first(),
+                    "pop_first at step {step}"
+                );
+                assert_eq!(
+                    glass.pop_last(),
+                    oracle.pop_last(),
+                    "pop_last at step {step}"
+                );
+            }
+            _ => {
+                let hi = key.saturating_add(rng.below(4000) as u32);
+                let mine: Vec<(u32, u64)> = glass.range(key..hi).take(50).collect();
+                let theirs: Vec<(u32, u64)> = oracle
+                    .range(key..hi)
+                    .take(50)
+                    .map(|(&k, &v)| (k, v))
+                    .collect();
+                assert_eq!(mine, theirs, "range({key}..{hi}) at step {step}");
+                assert_eq!(
+                    glass.contains_key(key),
+                    oracle.contains_key(&key),
+                    "contains_key({key}) at step {step}"
                 );
             }
         }

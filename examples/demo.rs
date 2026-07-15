@@ -26,11 +26,22 @@ fn main() {
         println!("level {price} x {qty}");
     }
 
-    // Estimate, then execute a market buy of 700 shares.
+    // BTreeMap-style navigation.
+    println!("next after 90: {:?}", book.next_level(90)); // Some((100, 500))
+    println!(
+        "levels in 95..=110: {:?}",
+        book.range(95..=110).collect::<Vec<_>>()
+    );
+
+    // Estimate, then execute a market buy of 700 shares (cheapest first).
     let estimate = book.compute_buy_cost(700);
     let cost = book.buy_shares(700);
     assert_eq!(estimate, cost);
     println!("bought 700 shares for {cost}"); // 90*400 + 100*300 = 66000
+
+    // Sell into the book (highest levels first).
+    let proceeds = book.sell_shares(100);
+    println!("sold 100 shares for {proceeds}");
 
     println!("remaining: {:?}", book.iter().collect::<Vec<_>>());
 }
