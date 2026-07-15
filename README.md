@@ -30,9 +30,10 @@ the best price). It supports `insert`, `remove`, `get`, `update_value`, `min`,
 5. **Whole-leaf consumption** — `buy_shares` and `compute_buy_cost` process 64
    price levels at a time: one vectorized sum plus one ancestor walk per leaf,
    instead of per-level tree operations.
-6. **Hardware acceleration** — BMI1/BMI2/LZCNT bit scans, and AVX-512F/DQ
-   (`vpmullq`) leaf reductions where available. All CPU features are detected
-   at runtime with portable fallbacks.
+6. **Hardware acceleration** — BMI1/BMI2/LZCNT/POPCNT bit scans, and
+   AVX-512F/DQ (`vpmullq`) leaf reductions where available. All CPU features
+   are detected at runtime with portable fallbacks; the crate builds on any
+   architecture (CI checks aarch64).
 7. **Preemption principle (paper §4.5)** — the trie holds only the best
    `MAX_SIZE` (4096) price levels; worse levels overflow into a hash map and
    are pulled back by `restructure()` as the trie drains. This bounds memory
@@ -72,24 +73,49 @@ cargo test --release           # exercises the AVX-512 paths under optimization
 use glass_rs::Glass;
 
 fn main() {
-    let mut glass = Glass::new();
+    let mut book = Glass::new();
 
     // Insert price levels (price -> quantity)
-    glass.insert(100, 500);
-    glass.insert(110, 300);
-    glass.insert(90, 400);
+    book.insert(100, 500);
+    book.insert(110, 300);
+    book.insert(90, 400);
 
-    assert_eq!(glass.get(100), Some(500));
-    assert_eq!(glass.min(), Some((90, 400)));
-    assert_eq!(glass.max(), Some((110, 300)));
+    assert_eq!(book.get(100), Some(500));
+    assert_eq!(book.min(), Some((90, 400)));
+    assert_eq!(book.max(), Some((110, 300)));
+    assert_eq!(book.len(), 3);
+
+    // Iterate levels in ascending price order (top of book first)
+    for (price, qty) in book.iter().take(25) {
+        println!("{price} x {qty}");
+    }
 
     // Estimate, then execute a market order for 700 shares
-    let est = glass.compute_buy_cost(700);
-    let cost = glass.buy_shares(700);
+    let est = book.compute_buy_cost(700);
+    let cost = book.buy_shares(700);
     assert_eq!(est, cost); // 90*400 + 100*300
-    assert_eq!(glass.get(90), None); // level consumed
+    assert_eq!(book.get(90), None); // level consumed
 }
 ```
+
+Also available: `update_value` (in-place adjust; reaching zero deletes the
+level), `remove_by_index` (k-th smallest), `clear` (reset, keeps allocations),
+`Extend`/`FromIterator`, and `Debug`. See `cargo doc --open` and
+`examples/demo.rs`.
+
+## Build configuration for Skylake/Cascade Lake (JCC erratum)
+
+This repository sets `-C llvm-args=-x86-branches-within-32B-boundaries` in
+`.cargo/config.toml`. On CPUs affected by the Intel JCC erratum (Skylake-SP /
+Cascade Lake, e.g. Xeon Gold 62xx), conditional branches that touch a 32-byte
+code boundary disable the uop cache for their line; in our measurements this
+caused layout-dependent swings of up to ~80% on hot loops between otherwise
+identical builds. The flag pads branches so this cannot happen and made every
+hot path measurably faster and *stable* across rebuilds.
+
+Cargo config does **not** propagate to dependent crates — applications
+embedding glass-rs should set the same flag in their own build when deploying
+to affected CPUs.
 
 ## Configuration
 
@@ -111,19 +137,21 @@ run is the stable signal.
 
 | Operation                        | Glass (ns/op) | BTreeMap (ns/op) | Speedup   |
 |----------------------------------|---------------|------------------|-----------|
-| Insert                           | 5.88          | 51.98            | 8.8x      |
-| Get (existing)                   | 2.66          | 51.27            | 19.3x     |
-| Get (non-existing)               | 2.70          | 52.66            | 19.5x     |
-| Remove (incl. insert)*           | 8.60          | 56.67            | 6.6x      |
-| Min                              | 2.23          | 2.53             | 1.1x      |
-| Max                              | 3.26          | 3.44             | 1.1x      |
-| Compute Buy Cost (1k shares)     | 8.33          | 7.79             | ~parity   |
-| **Buy Shares (1k shares)**       | **621**       | **9,558**        | **15.4x** |
-| **Compute Buy Cost (500k, deep)**| **250**       | **2,436**        | **9.7x**  |
-| **Buy Shares (500k, deep)**      | **2,654**     | **42,892**       | **16.2x** |
+| Insert                           | 4.24          | 51.48            | 12.1x     |
+| Get (existing)                   | 2.43          | 47.19            | 19.4x     |
+| Get (non-existing)               | 2.51          | 47.96            | 19.1x     |
+| Remove (incl. insert)*           | 5.13          | 52.65            | 10.3x     |
+| Min                              | 2.97          | 2.76             | ~parity   |
+| Max                              | 3.79          | 3.22             | ~parity   |
+| Compute Buy Cost (1k shares)     | 11.10         | 8.18             | 0.7x      |
+| **Buy Shares (1k shares)**       | **773**       | **9,971**        | **12.9x** |
+| **Compute Buy Cost (500k, deep)**| **297**       | **2,066**        | **7.0x**  |
+| **Buy Shares (500k, deep)**      | **2,495**     | **31,558**       | **12.6x** |
 
 \* The remove benchmark re-inserts 1M keys per iteration; remove alone is
-≈2.7 ns/op after subtracting the insert cost.
+≈0.9 ns/op after subtracting the insert cost. All rows built with the JCC
+mitigation flag (see below), which also speeds up the BTreeMap baseline —
+these ratios are honest.
 
 The *deep sweep* benchmarks execute/estimate a 500,000-share order spanning
 ~24 leaves (≈1,500 price levels), which is where whole-leaf vectorized

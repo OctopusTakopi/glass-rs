@@ -9,15 +9,19 @@ Rust implementation of the "glass" data structure from [arXiv:2506.13991](https:
 ## Commands
 
 ```bash
-cargo test                          # all 20 unit tests (fast, <1s)
+cargo test                          # unit + differential tests (fast, ~1s)
 cargo test test_buy_shares          # single test by name
-cargo run                           # src/main.rs demo of the public API
+cargo run --example demo            # public API demo
 cargo bench                         # full criterion suite, ~6s measurement per bench, very slow overall
 cargo bench -- buy_shares           # single benchmark by filter
 cargo bench --no-run                # compile-check benches without running them
+cargo check --target aarch64-unknown-linux-gnu   # portability check (CI does this)
+cargo clippy --all-targets -- -D warnings && cargo fmt --check
 ```
 
-Benchmarks compare every operation against `std::collections::BTreeMap`; the BTreeMap baselines live in `benches/basic.rs` alongside the glass ones. For numbers that match the README, build with `RUSTFLAGS="-C target-cpu=native"`.
+Benchmarks compare every operation against `std::collections::BTreeMap`; the BTreeMap baselines live in `benches/basic.rs` alongside the glass ones.
+
+**Benchmarking on this machine is treacherous.** The dev CPU (Xeon Gold 6230, Cascade Lake) has the Intel JCC erratum: without the `-x86-branches-within-32B-boundaries` LLVM flag (set in `.cargo/config.toml` — do not remove it), hot-loop timings swing ±40-80% between rebuilds purely from code-layout luck. Even with it, the machine has heavy ambient load. Never trust cross-run criterion deltas here: A/B by building both binaries first, then running them interleaved (min-of-N), and use `perf stat` instruction counts (deterministic) to distinguish real work from layout effects.
 
 ## Architecture
 
@@ -63,6 +67,10 @@ These accelerate lookups and must all be kept consistent on mutation:
 ### SIMD leaf reduction
 
 `leaf_sums` returns `(Σ qty, Σ slot·qty)` over a leaf's 64 values; empty slots are zero so no masking is needed, and whole-leaf cost is `base·Σqty + Σ(slot·qty)`. Runtime-dispatched: `leaf_sums_avx512` (needs AVX-512F + DQ for `vpmullq`, detected into `has_avx512`) or `leaf_sums_scalar`. Inner sums wrap; callers combine with saturating arithmetic — keep that convention.
+
+### Portability and dispatch conventions
+
+All x86 intrinsics are cfg-gated (`target_arch = "x86_64"`, and `not(miri)` for prefetch/SIMD); the crate must keep compiling on aarch64 (CI checks it). Bit scans go through the runtime-dispatched helpers `tz64` / `clear_lowest_bit` / `high_bit` / `popcnt64` — note that plain `count_ones()` compiles to a software fallback on baseline x86-64, so `popcnt64` matters on counting paths. Hot public methods are `#[inline(always)]`, but rare paths are deliberately outlined (`#[cold]`/`#[inline(never)]`: `trie_find_leaf`, `remove_zeroed_glass_value`, `insert_new_glass_key`) to keep hot bodies small and layout-stable — keep new rare paths out of line too.
 
 ### Interior mutability and threading
 

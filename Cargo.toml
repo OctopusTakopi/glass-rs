@@ -1,13 +1,16 @@
 [package]
 name = "glass-rs"
-version = "0.0.2"
+version = "0.1.0"
 authors = ["OctopusTakopi"]
-description = "Rust implementation of glass: ordered set data structure for client-side order books."
+description = "Trie-based ordered map for client-side order books (arXiv:2506.13991): cached paths, bounded hash-table cache, preemption, and AVX-512 accelerated order sweeps."
 repository = "https://github.com/OctopusTakopi/glass-rs"
 readme = "README.md"
-keywords = ["data structure", "order book"]
+keywords = ["order-book", "trie", "hft", "market-data", "data-structures"]
+categories = ["data-structures", "finance", "algorithms"]
 license = "MIT"
 edition = "2024"
+rust-version = "1.89"
+exclude = [".idea/", ".github/"]
 
 [dependencies]
 ahash = "0.8"

@@ -1,0 +1,9 @@
+# Mitigates the Intel JCC erratum (Skylake / Cascade Lake, e.g. Xeon Gold
+# 62xx): conditional branches that touch a 32-byte boundary disable the uop
+# cache for their line, causing large (up to ~80% on hot loops here) and
+# layout-lottery-dependent slowdowns. This flag pads code so branches never
+# touch a boundary. Applications embedding glass-rs should set the same flag
+# in their own build when targeting affected CPUs (this file does not
+# propagate to dependents).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "llvm-args=-x86-branches-within-32B-boundaries"]

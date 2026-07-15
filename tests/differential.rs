@@ -66,6 +66,11 @@ impl Rng {
 fn check_all(glass: &Glass, oracle: &BTreeMap<u32, u64>, universe: &[u32], ctx: &str) {
     assert_eq!(glass.min(), oracle_min(oracle), "min mismatch ({ctx})");
     assert_eq!(glass.max(), oracle_max(oracle), "max mismatch ({ctx})");
+    assert_eq!(glass.len(), oracle.len(), "len mismatch ({ctx})");
+    assert_eq!(glass.is_empty(), oracle.is_empty(), "is_empty ({ctx})");
+    let mine: Vec<(u32, u64)> = glass.iter().collect();
+    let theirs: Vec<(u32, u64)> = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+    assert_eq!(mine, theirs, "iter mismatch ({ctx})");
     for &k in universe {
         assert_eq!(
             glass.get(k),
@@ -185,6 +190,44 @@ fn boundary_keys() {
     assert_eq!(glass.max(), None);
 }
 
+/// clear() must fully reset routing state, not just empty the containers.
+#[test]
+fn clear_resets_routing() {
+    let mut glass = Glass::new();
+    for i in 0..5000u32 {
+        glass.insert(i, 1); // crosses the preemption boundary
+    }
+    assert_eq!(glass.len(), 5000);
+    glass.clear();
+    assert_eq!(glass.len(), 0);
+    assert!(glass.is_empty());
+    assert_eq!(glass.min(), None);
+    assert_eq!(glass.iter().next(), None);
+
+    // Reuse after clear must behave like a fresh glass.
+    let mut oracle = BTreeMap::new();
+    for i in 0..5000u32 {
+        glass.insert(i * 3, (i as u64 % 7) + 1);
+        oracle.insert(i * 3, (i as u64 % 7) + 1);
+    }
+    let keys: Vec<u32> = oracle.keys().copied().collect();
+    check_all(&glass, &oracle, &keys, "after clear+refill");
+    assert_eq!(
+        glass.buy_shares(u64::MAX),
+        oracle_buy_shares(&mut oracle, u64::MAX)
+    );
+}
+
+/// FromIterator/Extend round-trip through iter().
+#[test]
+fn from_iterator_round_trip() {
+    let src: Vec<(u32, u64)> = (0..1000u32).map(|i| (i * 5, i as u64 + 1)).collect();
+    let glass: Glass = src.iter().copied().collect();
+    assert_eq!(glass.len(), 1000);
+    let collected: Vec<(u32, u64)> = glass.iter().collect();
+    assert_eq!(collected, src);
+}
+
 /// Randomized differential test crossing the preemption boundary (> 4096 live
 /// keys) with mixed operations.
 #[test]
@@ -197,9 +240,9 @@ fn random_ops_match_btreemap() {
     // preemption), and colliding stride keys (HT chain overflow).
     let key_for = |r: u64| -> u32 {
         match r % 10 {
-            0..=5 => 1000 + (r / 10 % 3000) as u32,       // dense band
-            6..=8 => ((r / 10) % 8000) as u32 * 16,        // wide band
-            _ => (((r / 10) % 32) as u32) << 18,           // colliding stride
+            0..=5 => 1000 + (r / 10 % 3000) as u32, // dense band
+            6..=8 => ((r / 10) % 8000) as u32 * 16, // wide band
+            _ => (((r / 10) % 32) as u32) << 18,    // colliding stride
         }
     };
 
