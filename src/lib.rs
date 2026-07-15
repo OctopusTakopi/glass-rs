@@ -716,6 +716,23 @@ impl Glass {
         }
     }
 
+    // Exclusive-ownership prefetch (prefetchw) for a leaf that is about to be
+    // written: the line arrives in Modified/Exclusive state, avoiding the
+    // read-then-RFO upgrade that a plain T0 hint would pay.
+    #[inline(always)]
+    #[cfg_attr(not(all(target_arch = "x86_64", not(miri))), allow(unused_variables))]
+    fn prefetch_leaf_w(&self, leaf_idx: u32) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        if leaf_idx != u32::MAX {
+            unsafe {
+                _mm_prefetch(
+                    std::ptr::from_ref(&self.leaf_arena[leaf_idx as usize]) as *const i8,
+                    _MM_HINT_ET0,
+                );
+            }
+        }
+    }
+
     /// Executes a market buy: consumes `shares_to_buy` from the cheapest
     /// levels upward, deleting depleted levels, and returns the total cost
     /// (saturating). Consumes whole leaves at a time — one vectorized sum +
@@ -757,7 +774,9 @@ impl Glass {
                     leaf.next_leaf,
                 )
             };
-            self.prefetch_leaf(next_leaf);
+            // The successor leaf will be consumed (written) next in a deep
+            // sweep — fetch it with intent to write.
+            self.prefetch_leaf_w(next_leaf);
             let (qty_total, weighted) = self.leaf_sums(&self.leaf_arena[leaf_idx as usize].values);
 
             if qty_total <= shares_to_buy {
@@ -1449,6 +1468,10 @@ fn leaf_sums_scalar(values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
 }
 
 // 8 x 512-bit lanes; vpmullq needs AVX-512DQ (Skylake-SP/Cascade Lake+).
+// A 256-bit AVX-512VL variant was measured 17% slower on deep estimation
+// sweeps and no better on the buy path; the 512-bit frequency-license
+// concern does not apply to this bursty usage (8 vpmullq per leaf), so zmm
+// is the right width here.
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 #[target_feature(enable = "avx512f,avx512dq")]
 fn leaf_sums_avx512(values: &[u64; NUM_CHILDREN]) -> (u64, u64) {

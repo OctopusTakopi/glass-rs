@@ -117,6 +117,28 @@ Cargo config does **not** propagate to dependent crates — applications
 embedding glass-rs should set the same flag in their own build when deploying
 to affected CPUs.
 
+## Deployment tuning (system level)
+
+For latency-critical deployment on a machine like the Xeon Gold 62xx this was
+tuned on, the following complement the in-crate optimizations:
+
+- **CPU pinning + `performance` governor** — pin the market-data thread
+  (`taskset`/`isolcpus`) and disable frequency scaling; Glass is
+  single-threaded by design.
+- **Transparent Huge Pages** — the arenas span several MB; 2MB pages cut dTLB
+  pressure on random access (`madvise` THP mode is a good default).
+- **L3 partitioning (`cat_l3`/resctrl)** — the hot trie is designed to sit in
+  cache; dedicating L3 ways to the order-book process protects it from noisy
+  neighbors.
+
+Instruction-set notes from tuning on this CPU: hardware `popcnt` dispatch is
+worth ~10-15% on `remove_by_index` (rustc does not emit it on the baseline
+target); 512-bit leaf reductions beat a 256-bit AVX-512VL variant by ~17% on
+deep estimation sweeps (the "heavy license" downclock concern does not apply
+to this bursty usage); `buy_shares` prefetches the next leaf with intent to
+write (`prefetchw`). `bsf`/`bsr` vs `tzcnt`/`lzcnt` makes no measurable
+difference on Intel cores for the non-zero masks used here.
+
 ## Configuration
 
 Constants at the top of `src/lib.rs`:
