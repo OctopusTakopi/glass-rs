@@ -1,0 +1,21 @@
+[package]
+name = "binance-tui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Live Binance USDT-M perpetual order book on glass-rs, in the terminal"
+
+[dependencies]
+glass-rs = { path = "../.." }
+tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+ureq = "2.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+
+[profile.release]
+debug = true   # symbols for trace-mcp / perf; no runtime cost
+
+# Standalone: not part of any parent workspace.
+[workspace]

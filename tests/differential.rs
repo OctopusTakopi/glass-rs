@@ -15,68 +15,22 @@ fn oracle_max(m: &BTreeMap<u32, u64>) -> Option<(u32, u64)> {
     m.iter().next_back().map(|(&k, &v)| (k, v))
 }
 
-fn oracle_buy_cost(m: &BTreeMap<u32, u64>, mut target: u64) -> u64 {
-    let mut cost = 0u64;
-    for (&p, &q) in m.iter() {
-        if target == 0 {
-            break;
-        }
-        let take = q.min(target);
-        cost += p as u64 * take;
-        target -= take;
-    }
-    cost
+// The greedy-execution oracles below are all `oracle_exec_sat`: exact u128
+// arithmetic saturated to u64, like the crate's API.
+fn oracle_buy_cost(m: &BTreeMap<u32, u64>, target: u64) -> u64 {
+    greedy_sat(m, target, false).0
 }
 
-fn oracle_buy_shares(m: &mut BTreeMap<u32, u64>, mut shares: u64) -> u64 {
-    let mut cost = 0u64;
-    while shares > 0 {
-        let Some((&p, &q)) = m.iter().next() else {
-            break;
-        };
-        if q <= shares {
-            cost += p as u64 * q;
-            shares -= q;
-            m.remove(&p);
-        } else {
-            cost += p as u64 * shares;
-            *m.get_mut(&p).unwrap() -= shares;
-            shares = 0;
-        }
-    }
-    cost
+fn oracle_buy_shares(m: &mut BTreeMap<u32, u64>, shares: u64) -> u64 {
+    oracle_exec_sat(m, shares, false, true)
 }
 
-fn oracle_sell_cost(m: &BTreeMap<u32, u64>, mut target: u64) -> u64 {
-    let mut proceeds = 0u64;
-    for (&p, &q) in m.iter().rev() {
-        if target == 0 {
-            break;
-        }
-        let take = q.min(target);
-        proceeds += p as u64 * take;
-        target -= take;
-    }
-    proceeds
+fn oracle_sell_cost(m: &BTreeMap<u32, u64>, target: u64) -> u64 {
+    greedy_sat(m, target, true).0
 }
 
-fn oracle_sell_shares(m: &mut BTreeMap<u32, u64>, mut shares: u64) -> u64 {
-    let mut proceeds = 0u64;
-    while shares > 0 {
-        let Some((&p, &q)) = m.iter().next_back() else {
-            break;
-        };
-        if q <= shares {
-            proceeds += p as u64 * q;
-            shares -= q;
-            m.remove(&p);
-        } else {
-            proceeds += p as u64 * shares;
-            *m.get_mut(&p).unwrap() -= shares;
-            shares = 0;
-        }
-    }
-    proceeds
+fn oracle_sell_shares(m: &mut BTreeMap<u32, u64>, shares: u64) -> u64 {
+    oracle_exec_sat(m, shares, true, true)
 }
 
 /// Deterministic xorshift so failures are reproducible.
@@ -618,4 +572,159 @@ fn random_ops_match_btreemap() {
     let _ = full;
     assert_eq!(glass.min(), None);
     assert_eq!(glass.glass_size(), 0);
+}
+
+// Exact greedy execution in u128, saturated to u64 like the crate's API:
+// walks levels from the lowest price (`from_top`: from the highest) until the
+// order is filled. Returns the cost and the (price, quantity) taken per level.
+fn greedy_sat(m: &BTreeMap<u32, u64>, mut shares: u64, from_top: bool) -> (u64, Vec<(u32, u64)>) {
+    let mut levels: Box<dyn Iterator<Item = (&u32, &u64)>> = if from_top {
+        Box::new(m.iter().rev())
+    } else {
+        Box::new(m.iter())
+    };
+    let mut cost: u128 = 0;
+    let mut taken = Vec::new();
+    while shares > 0 {
+        let Some((&p, &q)) = levels.next() else { break };
+        let take = q.min(shares);
+        cost += p as u128 * take as u128;
+        shares -= take;
+        taken.push((p, take));
+    }
+    (cost.min(u64::MAX as u128) as u64, taken)
+}
+
+// `greedy_sat`, optionally applied to the book (a market order executing).
+fn oracle_exec_sat(m: &mut BTreeMap<u32, u64>, shares: u64, from_top: bool, consume: bool) -> u64 {
+    let (cost, taken) = greedy_sat(m, shares, from_top);
+    if consume {
+        for (p, take) in taken {
+            let q = m.get_mut(&p).expect("level present");
+            *q -= take;
+            if *q == 0 {
+                m.remove(&p);
+            }
+        }
+    }
+    cost
+}
+
+/// Regression: a leaf (64 adjacent prices) whose quantities sum past u64 used
+/// to wrap in `leaf_sums`, so the whole-leaf fast path charged a wrong cost
+/// and deleted levels the order never reached.
+#[test]
+fn leaf_sum_overflow_is_exact() {
+    // Buy side: leaf 1 sums to exactly 2^64.
+    let levels = [(10u32, 5u64), (64, 1 << 63), (65, 1 << 63)];
+    let mut glass: Glass = levels.iter().copied().collect();
+    let mut oracle: BTreeMap<u32, u64> = levels.iter().copied().collect();
+    assert_eq!(glass.compute_buy_cost(10), 370);
+    assert_eq!(
+        glass.buy_shares(10),
+        oracle_exec_sat(&mut oracle, 10, false, true)
+    );
+    assert_eq!(
+        glass.iter().collect::<Vec<_>>(),
+        oracle.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>()
+    );
+
+    // Sell side, mirrored.
+    let levels = [(10u32, 1u64 << 63), (11, 1 << 63), (100, 5)];
+    let mut glass: Glass = levels.iter().copied().collect();
+    let mut oracle: BTreeMap<u32, u64> = levels.iter().copied().collect();
+    assert_eq!(glass.compute_sell_cost(10), 555);
+    assert_eq!(
+        glass.sell_shares(10),
+        oracle_exec_sat(&mut oracle, 10, true, true)
+    );
+    assert_eq!(
+        glass.iter().collect::<Vec<_>>(),
+        oracle.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>()
+    );
+
+    // The slot-weighted sum wraps while the quantity sum does not: the true
+    // cost exceeds u64, so the answer must saturate.
+    let mut glass: Glass = [(63u32, 1u64 << 59)].into_iter().collect();
+    assert_eq!(glass.compute_buy_cost(1 << 59), u64::MAX);
+    assert_eq!(glass.buy_shares(1 << 59), u64::MAX);
+    assert!(glass.is_empty());
+}
+
+/// Randomized: huge quantities around the exactness bound (2^52), the
+/// weighted-sum wrap (2^58..2^59) and the quantity-sum wrap (2^63), against an
+/// exact u128 oracle, across both tiers.
+#[test]
+fn huge_quantities_match_exact_oracle() {
+    let mut rng = Rng(0xD1B54A32D192ED03);
+    let qty = |rng: &mut Rng| -> u64 {
+        match rng.below(6) {
+            0 => rng.below(1000) + 1,
+            1 => (1 << 52) + rng.below(1000),
+            2 => (1 << 58) + rng.below(1 << 58),
+            3 => (1 << 63) + rng.below(1 << 62),
+            4 => u64::MAX - rng.below(1000),
+            _ => rng.below(u64::MAX) + 1,
+        }
+    };
+    for round in 0..300u64 {
+        let mut glass = Glass::new();
+        let mut oracle = BTreeMap::new();
+        // Mostly a few dense leaves; every 10th round 6000 distinct levels,
+        // so ~1900 of them spill into the preempt tier.
+        let spill = round % 10 == 0;
+        let n = if spill { 6000 } else { rng.below(200) + 1 };
+        for i in 0..n {
+            let k = if spill {
+                i as u32 * 3
+            } else {
+                rng.below(256) as u32
+            };
+            let v = qty(&mut rng);
+            glass.insert(k, v);
+            oracle.insert(k, v);
+        }
+        if spill {
+            assert!(oracle.len() > 4096, "spill round must overflow the trie");
+        }
+        for step in 0..20 {
+            let shares = match rng.below(3) {
+                0 => rng.below(1 << 20),
+                1 => qty(&mut rng),
+                _ => u64::MAX,
+            };
+            let ctx = format!("round {round} step {step} shares {shares}");
+            assert_eq!(
+                glass.compute_buy_cost(shares),
+                oracle_exec_sat(&mut oracle, shares, false, false),
+                "compute_buy_cost {ctx}"
+            );
+            assert_eq!(
+                glass.compute_sell_cost(shares),
+                oracle_exec_sat(&mut oracle, shares, true, false),
+                "compute_sell_cost {ctx}"
+            );
+            if rng.below(2) == 0 {
+                assert_eq!(
+                    glass.buy_shares(shares),
+                    oracle_exec_sat(&mut oracle, shares, false, true),
+                    "buy_shares {ctx}"
+                );
+            } else {
+                assert_eq!(
+                    glass.sell_shares(shares),
+                    oracle_exec_sat(&mut oracle, shares, true, true),
+                    "sell_shares {ctx}"
+                );
+            }
+            assert_eq!(glass.len(), oracle.len(), "len {ctx}");
+            assert_eq!(glass.min(), oracle_min(&oracle), "min {ctx}");
+            assert_eq!(glass.max(), oracle_max(&oracle), "max {ctx}");
+        }
+        assert_eq!(
+            glass.iter().collect::<Vec<_>>(),
+            oracle.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(),
+            "book after round {round}"
+        );
+    }
 }

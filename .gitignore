@@ -22,3 +22,6 @@ target
 .idea
 
 Cargo.lock
+
+# Local Lean proof workspace (not part of the crate)
+lean/

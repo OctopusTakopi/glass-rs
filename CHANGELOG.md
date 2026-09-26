@@ -2,10 +2,59 @@
 
 ## Unreleased
 
-- `nightly` cargo feature: `core::hint::likely`/`unlikely` annotations on
-  the hot routing branches (no-op shims on stable). Measured neutral to
-  slightly positive under the JCC-mitigated build; README documents PGO as
-  the principled route to layout-level gains.
+- **Fix: leaf-sum overflow.** `leaf_sums` wrapped mod 2^64, so a leaf (64
+  adjacent prices) whose quantities summed past `u64` sent `buy_shares`,
+  `sell_shares`, `compute_buy_cost` and `compute_sell_cost` down the
+  whole-leaf path with a wrong cost, and the executors deleted levels the
+  order never reached (e.g. buying 10 from `{10:5, 64:2^63, 65:2^63}` cost
+  9223372036854775858 instead of 370 and emptied the book). `leaf_sums` now
+  returns exact totals or `None`: the SIMD pass is exact while every quantity
+  is below 2^52 (one `vptestmq`), anything larger is re-summed in `u128` out
+  of line. Regression tests + an exact-oracle randomized test.
+- **Nightly toolchain** (`rust-toolchain.toml`): `likely`/`unlikely` hints are
+  always on (measured 1-5% on the routing and sweep paths), and leaf
+  prefetches use the portable `core::hint::prefetch_*`, so aarch64 gets them
+  too. The `nightly` cargo feature is kept as a deprecated no-op.
+- **Bit scans inline**: `tz64`/`high_bit`/`clear_lowest_bit` and popcounts use the
+  integer methods instead of runtime-dispatched BMI/LZCNT/POPCNT intrinsics,
+  which could not inline into the baseline-x86-64 callers and cost a call per
+  scan: `compute_buy_cost` -33% cycles, deep estimate -29%.
+- **AVX2 leaf sums** for CPUs without AVX-512: 23-40% faster deep sweeps
+  than the scalar reduction (measured with AVX-512 disabled).
+- **No bare `unwrap` in library code; broken invariants fail loudly**:
+  `invariant_violated(&str) -> !` panics in every build with a message naming
+  the invariant, at the point of detection.
+- **Deep-book latency fix**: on a book deeper than 4096 levels, every trie
+  removal re-sorted the whole preempt map (`restructure` ran per removal and
+  `preempt_insert` dirtied the sorted-key cache even on quantity overwrites):
+  ~830k cycles per op on a 12k-level churn workload. The preempt tier stays
+  the paper's hash table (quantity updates are one hash write; a `BTreeMap`
+  measured 9x slower there) plus an ordered `BTreeSet` index of its key set,
+  touched only when a level appears or disappears. Once the trie is 32
+  levels short, a mutating call pulls at most 32 of the lowest keys off the
+  index (O(log p) each), so no operation is O(p) and no refill is unbounded:
+  after a big sweep the trie is topped up 32 levels per later call, and a buy
+  sweep that empties the trie fills the rest straight from the preempt tier.
+  On a 12k-level book, p99.99 per-op latency fell from
+  ~180k to ~16-22k TSC ticks and the worst op from ~640k to ~50-100k (the
+  rest is hashbrown's own in-place rehash; the map keeps 2x capacity so it
+  never grows mid-stream). The lazily sorted key cache, its dirty flag, the
+  lazy bounds and the last `UnsafeCell` are gone.
+- **`remove_by_index`**: the rank descent runs as one POPCNT(+BMI2) kernel
+  (-22% cycles); PDEP is used only where it is hardware (not AMD before Zen 3
+  or Hygon, where it is microcoded).
+- **Toolchain pinned** to `nightly-2026-09-25`.
+- **Cleanup**: removed never-read `parent` fields and a no-op padding field,
+  the always-zero `root` field (now `ROOT`), every `UnsafeCell`
+  (`cached_path` is `[Cell<u32>; 5]`), and 512-byte leaf zeroing on free that
+  reuse redoes; shared prune/level helpers; corrected comments (the write prefetch is `prefetchw` only with
+  `prfchw` enabled).
+- **Benchmarks**: the setup-based benches (buy/sell shares, remove by index)
+  no longer time dropping the book (their routines return it so criterion
+  drops it outside the timed region), and the key/value generators use fixed
+  seeds. This removes most of the old 1k-share buy/sell "speedup" (it was the
+  `BTreeMap`'s drop time); deep buy/sell now measure 17.7x / 29.8x. README
+  table regenerated (best of two pinned runs, `latency-performance`).
 
 - `top_levels(n, &mut buf)`: allocation-free best-N snapshot for imbalance
   computation; ~1.5x faster than `BTreeMap` at depth 25, with AVX-512

@@ -29,45 +29,71 @@
 //!
 //! - A value of `0` means "absent": [`Glass::insert`] with 0 deletes the
 //!   level, and an [`Glass::update_value`] that reaches 0 removes the level.
-//! - Cost arithmetic ([`Glass::buy_shares`], [`Glass::compute_buy_cost`]) is
-//!   saturating.
+//! - Cost arithmetic ([`Glass::buy_shares`], [`Glass::compute_buy_cost`] and
+//!   the sell-side mirrors) is exact and saturates at `u64::MAX`.
 //! - `Glass` is single-threaded by design: it is `Send` but not `Sync`,
 //!   because read operations update internal caches through interior
 //!   mutability.
-//! - All CPU features (BMI1/BMI2/LZCNT/POPCNT/AVX-512F+DQ) are detected at
-//!   runtime; portable fallbacks are used elsewhere, and the crate builds on
-//!   any architecture.
+//! - SIMD kernels (AVX-512F+DQ, AVX2) and PDEP select are detected at
+//!   runtime, with portable fallbacks; the crate builds on any architecture.
+//!   Requires a nightly toolchain.
 #![warn(missing_docs)]
-#![cfg_attr(feature = "nightly", feature(likely_unlikely))]
+#![feature(likely_unlikely, hint_prefetch)]
 
 use ahash::AHashMap as HashMap;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::Cell;
+use std::collections::{BTreeSet, btree_set};
+use std::ops::Bound;
 
 const BITS_PER_LEVEL: usize = 6;
 const NUM_CHILDREN: usize = 1 << BITS_PER_LEVEL;
 const PAD_BITS: usize = 4; // 36 total bits -> 6 levels
 const NUM_LEVELS: usize = 6;
 const MAX_SIZE: usize = 4096;
+// Once the trie is REFILL_BATCH levels short, a mutating call pulls at most
+// REFILL_BATCH of the lowest preempt levels back into it. Each move is
+// O(log p) via the ordered key index, so one refill is bounded (~8k cycles)
+// whatever the book depth or however far the trie was drained: after a big
+// sweep, later calls top the trie up 32 levels at a time (meanwhile the best
+// levels are served, correctly, from the preempt tier). The band also keeps
+// top-of-book churn (remove best / insert new best) from ping-ponging a level
+// between the tiers on every event, which refilling after every removal did
+// (4x slower churn).
+const REFILL_BATCH: usize = 32;
 const HT_SIZE: usize = 4096;
 const ARENA_CAPACITY: usize = 16384;
 const LEAF_ARENA_CAPACITY: usize = 4096;
 const HT_MAX_LOOKUP_LEN: usize = 5;
+// The root is always arena slot 0 (`new` and `clear` push it first).
+const ROOT: u32 = 0;
 
-// Branch-probability hints: real on nightly (feature = "nightly"), identity
-// on stable so the call sites read the same either way.
-#[cfg(feature = "nightly")]
-use core::hint::{likely, unlikely};
-#[cfg(not(feature = "nightly"))]
-#[inline(always)]
-fn likely(b: bool) -> bool {
-    b
+// Branch-probability hints on the hot routing branches, and portable
+// prefetches (x86 prefetcht0/prefetchw, aarch64 prfm) for leaf sweeps.
+use core::hint::{Locality, likely, prefetch_read, prefetch_write, unlikely};
+
+// A state the internal invariants rule out has been reached: the book is
+// corrupt. Fail loudly, in every
+// build, at the point of detection. Carrying on would hand the caller
+// plausible-looking wrong prices and costs, which for a trading book is
+// worse than stopping.
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn invariant_violated(what: &'static str) -> ! {
+    panic!("glass-rs internal invariant violated: {what}");
 }
-#[cfg(not(feature = "nightly"))]
+
+// Quantity of a key that the preempt key index says is in the preempt map
+// (the index and the map always hold the same key set).
 #[inline(always)]
-fn unlikely(b: bool) -> bool {
-    b
+#[track_caller]
+fn preempt_qty(preempt: &HashMap<u32, u64>, key: u32) -> u64 {
+    match preempt.get(&key) {
+        Some(&qty) => qty,
+        None => invariant_violated("preempt bookkeeping names a key missing from the map"),
+    }
 }
 
 // Tri-state answers of the bounded hash-table probe (paper §5.2), encoded as
@@ -79,7 +105,6 @@ const HT_UNKNOWN: u32 = u32::MAX - 1;
 struct InternalNode {
     mask: u64,
     count: u32,
-    parent: u32,
     children: [u32; NUM_CHILDREN],
 }
 
@@ -88,7 +113,6 @@ impl InternalNode {
         Self {
             mask: 0,
             count: 0,
-            parent: u32::MAX,
             children: [u32::MAX; NUM_CHILDREN],
         }
     }
@@ -101,11 +125,19 @@ struct LeafNode {
     ht_k: u32, // partial key (key >> 6)
     next_leaf: u32,
     prev_leaf: u32,
-    parent: u32,
     values: [u64; NUM_CHILDREN],
 }
 
 impl LeafNode {
+    // The `(price, quantity)` level stored in `slot`.
+    #[inline(always)]
+    fn level(&self, slot: usize) -> (u32, u64) {
+        (
+            (self.ht_k << BITS_PER_LEVEL) | slot as u32,
+            self.values[slot],
+        )
+    }
+
     fn new() -> Self {
         Self {
             mask: 0,
@@ -114,65 +146,106 @@ impl LeafNode {
             ht_k: u32::MAX,
             next_leaf: u32::MAX,
             prev_leaf: u32::MAX,
-            parent: u32::MAX,
             values: [0; NUM_CHILDREN],
         }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-fn detect_features() -> (bool, bool, bool, bool, bool) {
-    (
-        std::is_x86_feature_detected!("bmi2"),
-        std::is_x86_feature_detected!("bmi1"),
-        std::is_x86_feature_detected!("lzcnt"),
-        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512dq"),
-        std::is_x86_feature_detected!("popcnt"),
-    )
+fn detect_features() -> Features {
+    let popcnt = std::is_x86_feature_detected!("popcnt");
+    Features {
+        fast_pdep: popcnt
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && !pdep_is_microcoded(),
+        popcnt,
+        avx512: std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512dq"),
+        avx2: std::is_x86_feature_detected!("avx2"),
+    }
+}
+
+// AMD before Zen 3 (family 0x19) and Hygon implement PDEP/PEXT in microcode
+// (~18-290 cycles, data-dependent); the portable select loop beats it there.
+#[cfg(target_arch = "x86_64")]
+fn pdep_is_microcoded() -> bool {
+    let id = __cpuid(0);
+    let vendor = (id.ebx, id.edx, id.ecx);
+    let amd = vendor == (0x6874_7541, 0x6974_6e65, 0x444d_4163); // "AuthenticAMD"
+    let hygon = vendor == (0x6f67_7948, 0x6e65_476e, 0x656e_6975); // "HygonGenuine"
+    if !(amd || hygon) {
+        return false;
+    }
+    let eax = __cpuid(1).eax;
+    let base = (eax >> 8) & 0xF;
+    let family = if base == 0xF {
+        base + ((eax >> 20) & 0xFF)
+    } else {
+        base
+    };
+    hygon || family < 0x19
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn detect_features() -> (bool, bool, bool, bool, bool) {
-    (false, false, false, false, false)
+fn detect_features() -> Features {
+    Features {
+        fast_pdep: false,
+        popcnt: false,
+        avx512: false,
+        avx2: false,
+    }
+}
+
+// Runtime-detected CPU capabilities used by the dispatched kernels.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+struct Features {
+    // BMI1 + BMI2 + POPCNT with a hardware (not microcoded) PDEP.
+    fast_pdep: bool,
+    popcnt: bool,
+    avx512: bool,
+    avx2: bool,
 }
 
 /// A trie-based ordered map from `u32` prices to `u64` quantities, optimized
 /// for client-side order books. See the [crate-level documentation](crate)
 /// for the design overview and semantics.
 pub struct Glass {
-    // === Hot frequently accessed fields ===
-    root: u32,
     cached_d: Cell<u32>,
     cached_last_key: Cell<Option<u32>>,
     min_key: Cell<u32>,
     max_key: Cell<u32>,
-    preempt_min: Cell<u32>,
-    preempt_max: Cell<u32>,
-    thres: Cell<u32>,
     min_leaf: Cell<u32>,
     max_leaf: Cell<u32>,
+    // Routing threshold (paper §4.5): the lowest preempt key, or u32::MAX (the
+    // paper's "infinity") when the preempt tier is empty. Kept exact on every
+    // key-set change; every trie key is below it.
+    thres: u32,
 
-    // Flags
-    preempt_bounds_valid: Cell<bool>,
-    preempt_dirty: Cell<bool>,
+    // `glass_find_kth_key` kernels: POPCNT + hardware PDEP, or POPCNT only.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    has_bmi2: bool,
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    has_bmi1: bool,
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    has_lzcnt: bool,
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    has_avx512: bool,
+    has_fast_pdep: bool,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     has_popcnt: bool,
-    _padding_flags: [u8; 3],
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    has_avx512: bool,
+    // AVX2 without AVX-512 (Zen 2/3, Intel client): the scalar leaf sums
+    // recompiled for AVX2 measured 23-40% faster on deep sweeps.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    has_avx2: bool,
 
-    // === Data structures ===
-    ht_heads: UnsafeCell<Vec<u32>>,
-    preempt: UnsafeCell<HashMap<u32, u64>>,
-    cached_path: UnsafeCell<[u32; 5]>, // Levels 0, 1, 2, 3, 4
+    ht_heads: Vec<u32>,
+    // The preempt (overflow) tier, as in the paper: a hash table, so the
+    // common deep-book event, a quantity change at an existing level, is one
+    // O(1) hash write.
+    preempt: HashMap<u32, u64>,
+    // Ordered index of `preempt`'s key set, touched only when a level
+    // appears or disappears (O(log p)). It gives O(log p) min/max, refills
+    // and ordered walks with no O(p) scan or sort anywhere.
+    preempt_keys: BTreeSet<u32>,
+    // Internal node at each trie level 0..=4 on the path to `cached_last_key`.
+    cached_path: [Cell<u32>; NUM_LEVELS - 1],
     cached_leaf: Cell<u32>,
-    sorted_preempt_keys: UnsafeCell<Vec<u32>>,
 
     arena: Vec<InternalNode>,
     free_list: Vec<u32>,
@@ -193,36 +266,29 @@ impl Glass {
         let mut arena = Vec::with_capacity(ARENA_CAPACITY);
         arena.push(InternalNode::new());
         let ht_heads = vec![u32::MAX; HT_SIZE];
-        let (has_bmi2, has_bmi1, has_lzcnt, has_avx512, has_popcnt) = detect_features();
+        let cpu = detect_features();
 
         Glass {
-            root: 0,
             cached_d: Cell::new(0),
             cached_last_key: Cell::new(None),
             min_key: Cell::new(u32::MAX),
             max_key: Cell::new(0),
-            preempt_min: Cell::new(u32::MAX),
-            preempt_max: Cell::new(0),
-            thres: Cell::new(u32::MAX),
             min_leaf: Cell::new(u32::MAX),
             max_leaf: Cell::new(u32::MAX),
-            preempt_bounds_valid: Cell::new(true),
-            preempt_dirty: Cell::new(false),
-            has_bmi2,
-            has_bmi1,
-            has_lzcnt,
-            has_avx512,
-            has_popcnt,
-            ht_heads: UnsafeCell::new(ht_heads),
-            preempt: UnsafeCell::new(HashMap::new()),
-            cached_path: UnsafeCell::new([0; 5]),
+            thres: u32::MAX,
+            has_fast_pdep: cpu.fast_pdep,
+            has_popcnt: cpu.popcnt,
+            has_avx512: cpu.avx512,
+            has_avx2: cpu.avx2,
+            ht_heads,
+            preempt: HashMap::new(),
+            preempt_keys: BTreeSet::new(),
+            cached_path: Default::default(),
             cached_leaf: Cell::new(u32::MAX),
-            sorted_preempt_keys: UnsafeCell::new(Vec::new()),
             arena,
             free_list: Vec::new(),
             leaf_arena: Vec::with_capacity(LEAF_ARENA_CAPACITY),
             leaf_free_list: Vec::new(),
-            _padding_flags: [0; 3],
         }
     }
 
@@ -230,12 +296,12 @@ impl Glass {
     /// `MAX_SIZE`, 4096). Excludes levels preempted into the overflow map;
     /// see [`Glass::len`] for the total.
     pub fn glass_size(&self) -> usize {
-        self.arena[self.root as usize].count as usize
+        self.arena[ROOT as usize].count as usize
     }
 
     /// Total number of live price levels across both tiers.
     pub fn len(&self) -> usize {
-        self.glass_size() + unsafe { (*self.preempt.get()).len() }
+        self.glass_size() + self.preempt.len()
     }
 
     /// Returns `true` if the book holds no price levels.
@@ -250,23 +316,17 @@ impl Glass {
         self.free_list.clear();
         self.leaf_arena.clear();
         self.leaf_free_list.clear();
-        unsafe {
-            (*self.ht_heads.get()).fill(u32::MAX);
-            (*self.preempt.get()).clear();
-            (*self.sorted_preempt_keys.get()).clear();
-        }
+        self.ht_heads.fill(u32::MAX);
+        self.preempt.clear();
+        self.preempt_keys.clear();
+        self.thres = u32::MAX;
         self.cached_d.set(0);
         self.cached_last_key.set(None);
         self.cached_leaf.set(u32::MAX);
         self.min_key.set(u32::MAX);
         self.max_key.set(0);
-        self.preempt_min.set(u32::MAX);
-        self.preempt_max.set(0);
-        self.thres.set(u32::MAX);
         self.min_leaf.set(u32::MAX);
         self.max_leaf.set(u32::MAX);
-        self.preempt_bounds_valid.set(true);
-        self.preempt_dirty.set(false);
     }
 
     /// Iterates all `(price, quantity)` levels in ascending price order.
@@ -275,7 +335,6 @@ impl Glass {
     /// overflow tier. The iterator borrows the glass immutably; levels cannot
     /// change while it is alive.
     pub fn iter(&self) -> Iter<'_> {
-        self.ensure_sorted_preempt_keys();
         let leaf_idx = self.min_leaf.get();
         let mask = if leaf_idx != u32::MAX {
             self.leaf_arena[leaf_idx as usize].mask
@@ -286,14 +345,12 @@ impl Glass {
             glass: self,
             leaf_idx,
             mask,
-            preempt_pos: 0,
+            preempt: self.preempt_keys.range(..),
         }
     }
 
     // Iterator positioned at the first level with price >= start.
     fn iter_at(&self, start: u32) -> Iter<'_> {
-        self.ensure_sorted_preempt_keys();
-
         let (leaf_idx, mask) = if self.glass_size() > 0 && start <= self.max_key.get() {
             if start <= self.min_key.get() {
                 let li = self.min_leaf.get();
@@ -327,14 +384,11 @@ impl Glass {
             (u32::MAX, 0)
         };
 
-        let keys = unsafe { &*self.sorted_preempt_keys.get() };
-        let preempt_pos = keys.partition_point(|&k| k < start);
-
         Iter {
             glass: self,
             leaf_idx,
             mask,
-            preempt_pos,
+            preempt: self.preempt_keys.range(start..),
         }
     }
 
@@ -382,29 +436,19 @@ impl Glass {
         if let Some(r) = self.glass_next(key) {
             return Some(r); // glass keys are the smallest: first hit wins
         }
-        let preempt = unsafe { &*self.preempt.get() };
-        if preempt.is_empty() {
-            return None;
-        }
-        self.ensure_sorted_preempt_keys();
-        let keys = unsafe { &*self.sorted_preempt_keys.get() };
-        let pos = keys.partition_point(|&k| k <= key);
-        keys.get(pos).map(|&k| (k, *preempt.get(&k).unwrap()))
+        let &k = self
+            .preempt_keys
+            .range((Bound::Excluded(key), Bound::Unbounded))
+            .next()?;
+        Some((k, preempt_qty(&self.preempt, k)))
     }
 
     /// Returns the highest level with price strictly less than `key`
     /// (the paper's `prev` operation).
     pub fn prev_level(&self, key: u32) -> Option<(u32, u64)> {
         // The overflow tier holds the highest prices: check it first.
-        let preempt = unsafe { &*self.preempt.get() };
-        if !preempt.is_empty() {
-            self.ensure_sorted_preempt_keys();
-            let keys = unsafe { &*self.sorted_preempt_keys.get() };
-            let pos = keys.partition_point(|&k| k < key);
-            if pos > 0 {
-                let k = keys[pos - 1];
-                return Some((k, *preempt.get(&k).unwrap()));
-            }
+        if let Some(&k) = self.preempt_keys.range(..key).next_back() {
+            return Some((k, preempt_qty(&self.preempt, k)));
         }
         self.glass_prev(key)
     }
@@ -420,22 +464,22 @@ impl Glass {
         let slot = (key & 0x3F) as usize;
         if let Some(li) = self.find_leaf(partial) {
             let leaf = &self.leaf_arena[li as usize];
-            if let Some(s) = self.find_next_set_bit(leaf.mask, slot + 1) {
-                return Some(((leaf.ht_k << BITS_PER_LEVEL) | s as u32, leaf.values[s]));
+            if let Some(s) = find_next_set_bit(leaf.mask, slot + 1) {
+                return Some(leaf.level(s));
             }
             let nl = leaf.next_leaf;
             if nl != u32::MAX {
                 let n = &self.leaf_arena[nl as usize];
-                let s = self.tz64(n.mask);
-                return Some(((n.ht_k << BITS_PER_LEVEL) | s as u32, n.values[s]));
+                let s = tz64(n.mask);
+                return Some(n.level(s));
             }
             None
         } else {
             let (_, nl) = self.find_neighbor_leaves(key);
             if nl != u32::MAX {
                 let n = &self.leaf_arena[nl as usize];
-                let s = self.tz64(n.mask);
-                return Some(((n.ht_k << BITS_PER_LEVEL) | s as u32, n.values[s]));
+                let s = tz64(n.mask);
+                return Some(n.level(s));
             }
             None
         }
@@ -452,22 +496,22 @@ impl Glass {
         let slot = (key & 0x3F) as usize;
         if let Some(li) = self.find_leaf(partial) {
             let leaf = &self.leaf_arena[li as usize];
-            if let Some(s) = self.find_prev_set_bit(leaf.mask, slot) {
-                return Some(((leaf.ht_k << BITS_PER_LEVEL) | s as u32, leaf.values[s]));
+            if let Some(s) = find_prev_set_bit(leaf.mask, slot) {
+                return Some(leaf.level(s));
             }
             let pl = leaf.prev_leaf;
             if pl != u32::MAX {
                 let p = &self.leaf_arena[pl as usize];
-                let s = self.high_bit(p.mask);
-                return Some(((p.ht_k << BITS_PER_LEVEL) | s as u32, p.values[s]));
+                let s = high_bit(p.mask);
+                return Some(p.level(s));
             }
             None
         } else {
             let (pl, _) = self.find_neighbor_leaves(key);
             if pl != u32::MAX {
                 let p = &self.leaf_arena[pl as usize];
-                let s = self.high_bit(p.mask);
-                return Some(((p.ht_k << BITS_PER_LEVEL) | s as u32, p.values[s]));
+                let s = high_bit(p.mask);
+                return Some(p.level(s));
             }
             None
         }
@@ -502,7 +546,7 @@ impl Glass {
             // take (typical small n) is cheaper via the scalar scan.
             #[cfg(all(target_arch = "x86_64", not(miri)))]
             {
-                let count = self.popcnt64(leaf.mask) as usize;
+                let count = leaf.mask.count_ones() as usize;
                 if self.has_avx512 && count >= 16 && n - out.len() >= count {
                     unsafe { extract_leaf_avx512(leaf, base, count, out) };
                     curr = leaf.next_leaf;
@@ -510,8 +554,6 @@ impl Glass {
                 }
             }
 
-            // Plain ops: bsf/blsr-equivalents need no dispatch on the scan
-            // chain, and flag branches inside this loop measurably cost.
             let mut mask = leaf.mask;
             while mask != 0 && out.len() < n {
                 let slot = mask.trailing_zeros() as usize;
@@ -522,16 +564,9 @@ impl Glass {
         }
 
         // Overflow tier tail (only when n exceeds the trie's levels).
-        if out.len() < n && !unsafe { (*self.preempt.get()).is_empty() } {
-            self.ensure_sorted_preempt_keys();
-            let keys = unsafe { &*self.sorted_preempt_keys.get() };
-            let preempt = unsafe { &*self.preempt.get() };
-            for &k in keys {
-                if out.len() >= n {
-                    break;
-                }
-                out.push((k, *preempt.get(&k).unwrap()));
-            }
+        let rest = n - out.len();
+        for &k in self.preempt_keys.iter().take(rest) {
+            out.push((k, preempt_qty(&self.preempt, k)));
         }
         out.len()
     }
@@ -604,19 +639,6 @@ impl Glass {
         upper
     }
 
-    #[inline(always)]
-    fn ensure_sorted_preempt_keys(&self) {
-        if self.preempt_dirty.get() {
-            unsafe {
-                let preempt = &*self.preempt.get();
-                let keys = &mut *self.sorted_preempt_keys.get();
-                *keys = preempt.keys().cloned().collect();
-                keys.sort_unstable();
-            }
-            self.preempt_dirty.set(false);
-        }
-    }
-
     // Paper §5.2: a bounded chain probe has three possible answers. "Absent"
     // is authoritative (every live leaf is chained), but "Unknown" (chain
     // longer than HT_MAX_LOOKUP_LEN without a match) requires falling back to
@@ -624,8 +646,7 @@ impl Glass {
     #[inline(always)]
     fn ht_lookup(&self, partial_key: u32) -> u32 {
         let h = (partial_key as usize) & (HT_SIZE - 1);
-        let heads = unsafe { &*self.ht_heads.get() };
-        let mut curr = heads[h];
+        let mut curr = self.ht_heads[h];
         let mut lookups = 0;
         while curr != u32::MAX && lookups < HT_MAX_LOOKUP_LEN {
             // Note: an unchecked index here was measured no faster under the
@@ -645,12 +666,12 @@ impl Glass {
         }
     }
 
-    // Cold fallback for HtAnswer::Unknown — keep it out of line so the hot
-    // lookup sites stay small.
+    // Full descent, for when `ht_lookup` answers HT_UNKNOWN. Out of line so
+    // the hot lookup sites stay small.
     #[cold]
     #[inline(never)]
     fn trie_find_leaf(&self, partial: u32) -> Option<u32> {
-        let mut node_idx = self.root;
+        let mut node_idx = ROOT;
         for l in 0..NUM_LEVELS - 1 {
             let shift = (NUM_LEVELS - 2 - l) * BITS_PER_LEVEL;
             let slot = ((partial >> shift) & 0x3F) as usize;
@@ -679,8 +700,7 @@ impl Glass {
     #[inline(always)]
     fn ht_insert(&mut self, leaf_idx: u32, partial_key: u32) {
         let h = (partial_key as usize) & (HT_SIZE - 1);
-        let heads = unsafe { &mut *self.ht_heads.get() };
-        let old_head = heads[h];
+        let old_head = self.ht_heads[h];
 
         let leaf = &mut self.leaf_arena[leaf_idx as usize];
         leaf.ht_k = partial_key;
@@ -690,7 +710,7 @@ impl Glass {
         if old_head != u32::MAX {
             self.leaf_arena[old_head as usize].ht_prev = leaf_idx;
         }
-        heads[h] = leaf_idx;
+        self.ht_heads[h] = leaf_idx;
     }
 
     #[inline(always)]
@@ -708,7 +728,7 @@ impl Glass {
             self.leaf_arena[prev as usize].ht_next = next;
         } else {
             let h = (partial_key as usize) & (HT_SIZE - 1);
-            unsafe { (&mut *self.ht_heads.get())[h] = next };
+            self.ht_heads[h] = next;
         }
 
         if next != u32::MAX {
@@ -716,50 +736,46 @@ impl Glass {
         }
     }
 
-    // Insert into the preempt tier, maintaining thres/preempt_min/preempt_max
-    // eagerly (paper §4.5 assigns the threshold on every preemption). If the
-    // bounds are currently invalid they stay invalid and are recomputed lazily.
+    // Insert into the preempt tier. A quantity overwrite at an existing level
+    // is a single hash write; a new level is added to the key index and may
+    // lower `thres` (paper §4.5 assigns the threshold on every preemption).
+    // Returns whether `key` is a new level.
     #[inline(always)]
-    fn preempt_insert(&mut self, key: u32, value: u64) {
-        unsafe {
-            (*self.preempt.get()).insert(key, value);
-        }
-        self.preempt_dirty.set(true);
-        if self.preempt_bounds_valid.get() {
-            if key < self.preempt_min.get() {
-                self.preempt_min.set(key);
-                self.thres.set(key);
+    fn preempt_insert(&mut self, key: u32, value: u64) -> bool {
+        let new = self.preempt.insert(key, value).is_none();
+        if new {
+            // Keep capacity >= 2x the live levels. Under deep-book churn the
+            // table fills with tombstones, and hashbrown then either rehashes
+            // in place (cheap) or, when more than half full, grows: a ~250 us
+            // one-off stall measured mid-session. With this headroom it only
+            // ever rehashes in place.
+            let len = self.preempt.len();
+            if self.preempt.capacity() < 2 * len {
+                self.preempt.reserve(len);
             }
-            if key > self.preempt_max.get() {
-                self.preempt_max.set(key);
-            }
+            self.preempt_keys.insert(key);
+            self.thres = self.thres.min(key);
         }
+        new
     }
 
-    // Remove from the preempt tier. Bounds stay valid unless a boundary key
-    // was removed (then they are recomputed lazily on the next routing check).
+    // Remove from the preempt tier, keeping the key index and `thres` exact.
     #[inline(always)]
     fn preempt_remove(&mut self, key: u32) -> Option<u64> {
-        let preempt = unsafe { &mut *self.preempt.get() };
-        let res = preempt.remove(&key);
+        let res = self.preempt.remove(&key);
         if res.is_some() {
-            if preempt.is_empty() {
-                self.thres.set(u32::MAX);
-                self.preempt_min.set(u32::MAX);
-                self.preempt_max.set(0);
-                self.preempt_bounds_valid.set(true);
-                self.preempt_dirty.set(false);
-                unsafe { (*self.sorted_preempt_keys.get()).clear() };
-            } else {
-                self.preempt_dirty.set(true);
-                if self.preempt_bounds_valid.get()
-                    && (key == self.preempt_min.get() || key == self.preempt_max.get())
-                {
-                    self.preempt_bounds_valid.set(false);
-                }
+            self.preempt_keys.remove(&key);
+            if key == self.thres {
+                self.refresh_thres();
             }
         }
         res
+    }
+
+    // `thres` = the lowest preempt key, or u32::MAX when the tier is empty.
+    #[inline(always)]
+    fn refresh_thres(&mut self) {
+        self.thres = self.preempt_keys.first().copied().unwrap_or(u32::MAX);
     }
 
     /// Inserts or overwrites the quantity at `key`. A `value` of 0 deletes
@@ -771,7 +787,7 @@ impl Glass {
             return;
         }
 
-        if self.check_bounds_and_thres(key) {
+        if self.routes_to_trie(key) {
             // Overwrite in place if the key is already present (routing and
             // leaf lookup happen exactly once on this hot path).
             if let Some(v) = self.glass_get_mut(key) {
@@ -782,7 +798,12 @@ impl Glass {
             // update-in-place path stays a small, layout-stable body.
             self.insert_new_glass_key(key, value);
         } else {
-            self.preempt_insert(key, value);
+            // A drained trie is topped up by later calls, whichever tier they
+            // touch, so it cannot stay short. An overwrite of an existing
+            // level changes nothing there, so skip the check.
+            if self.preempt_insert(key, value) {
+                self.refill_if_low();
+            }
         }
     }
 
@@ -807,15 +828,16 @@ impl Glass {
     /// cache table in the common case.
     #[inline(always)]
     pub fn get(&self, key: u32) -> Option<u64> {
-        if self.check_bounds_and_thres(key) {
+        if self.routes_to_trie(key) {
             self.glass_get(key)
         } else {
-            unsafe { (*self.preempt.get()).get(&key).copied() }
+            self.preempt.get(&key).copied()
         }
     }
 
-    /// Removes and returns the `k`-th smallest level (0-indexed), using the
-    /// per-subtree counts to descend in O(levels).
+    /// Removes and returns the `k`-th smallest level (0-indexed). Levels in
+    /// the trie (the lowest 4096) are found in O(levels) via per-subtree
+    /// counts; deeper levels by an O(k) walk of the overflow tier's key index.
     #[inline(always)]
     pub fn remove_by_index(&mut self, k: usize) -> Option<(u32, u64)> {
         if k == 0 {
@@ -829,13 +851,8 @@ impl Glass {
         let key_to_remove = if k < glass_size {
             self.glass_find_kth_key(k)?
         } else {
-            let preempt_k = k - glass_size;
-            self.ensure_sorted_preempt_keys();
-            let keys = unsafe { &*self.sorted_preempt_keys.get() };
-            if preempt_k >= keys.len() {
-                return None;
-            }
-            keys[preempt_k]
+            // The key index has no rank: O(k) walk past the trie's levels.
+            *self.preempt_keys.iter().nth(k - glass_size)?
         };
 
         self.remove(key_to_remove)
@@ -848,7 +865,7 @@ impl Glass {
     /// occupied slot).
     #[inline(always)]
     pub fn update_value(&mut self, key: u32, f: impl FnOnce(&mut u64)) -> bool {
-        if self.check_bounds_and_thres(key) {
+        if self.routes_to_trie(key) {
             match self.glass_get_mut(key) {
                 Some(mut_ref) => {
                     f(mut_ref);
@@ -864,18 +881,16 @@ impl Glass {
             self.remove_zeroed_glass_value(key);
             true
         } else {
-            let became_zero = unsafe {
-                let preempt = &mut *self.preempt.get();
-                match preempt.get_mut(&key) {
-                    Some(v) => {
-                        f(v);
-                        *v == 0
-                    }
-                    None => return false,
+            let became_zero = match self.preempt.get_mut(&key) {
+                Some(v) => {
+                    f(v);
+                    *v == 0
                 }
+                None => return false,
             };
             if became_zero {
                 self.preempt_remove(key);
+                self.refill_if_low();
             }
             true
         }
@@ -885,185 +900,143 @@ impl Glass {
     #[inline(never)]
     fn remove_zeroed_glass_value(&mut self, key: u32) {
         self.glass_remove(key);
-        if self.glass_size() < MAX_SIZE && !unsafe { (*self.preempt.get()).is_empty() } {
-            self.restructure();
-        }
+        self.refill_if_low();
     }
 
     /// Removes the level at `key`, returning its quantity if it was present.
     #[inline(always)]
     pub fn remove(&mut self, key: u32) -> Option<u64> {
-        if self.check_bounds_and_thres(key) {
+        if self.routes_to_trie(key) {
             let res = self.glass_remove(key);
-            if res.is_some()
-                && self.glass_size() < MAX_SIZE
-                && !unsafe { (*self.preempt.get()).is_empty() }
-            {
-                self.restructure();
+            if res.is_some() {
+                self.refill_if_low();
             }
             res
         } else {
-            self.preempt_remove(key)
+            let res = self.preempt_remove(key);
+            if res.is_some() {
+                self.refill_if_low();
+            }
+            res
         }
     }
 
+    // Tier routing: keys below `thres` live in the trie, the rest in the
+    // preempt tier (so u32::MAX, which never satisfies `< thres`, is pinned
+    // to the preempt tier).
     #[inline(always)]
-    fn check_bounds_and_thres(&self, key: u32) -> bool {
-        if unlikely(!self.preempt_bounds_valid.get()) {
-            self.update_preempt_bounds();
-        }
-        key < self.thres.get()
+    fn routes_to_trie(&self, key: u32) -> bool {
+        key < self.thres
     }
 
-    // Two-tier invariant: every glass key is strictly below thres, and thres
-    // is the minimum preempt key. So the global min is the glass min when the
-    // glass is non-empty, and the global max is the preempt max when the
-    // preempt map is non-empty.
-    /// Returns the lowest `(price, quantity)` level, or `None` if empty. O(1).
+    // Two-tier invariant: every trie key is strictly below thres, the lowest
+    // preempt key. So the global min is the trie min when the trie is
+    // non-empty, and the global max is the preempt max when that is non-empty.
+    /// Returns the lowest `(price, quantity)` level, or `None` if empty. O(1)
+    /// when the trie is non-empty.
     #[inline(always)]
     pub fn min(&self) -> Option<(u32, u64)> {
         if let Some(t) = self.glass_min() {
             return Some(t);
         }
-        let preempt = unsafe { &*self.preempt.get() };
-        if preempt.is_empty() {
-            return None;
-        }
-        if !self.preempt_bounds_valid.get() {
-            self.update_preempt_bounds();
-        }
-        let k = self.preempt_min.get();
-        Some((k, *preempt.get(&k).unwrap()))
+        let &k = self.preempt_keys.first()?;
+        Some((k, preempt_qty(&self.preempt, k)))
     }
 
-    /// Returns the highest `(price, quantity)` level, or `None` if empty. O(1)
-    /// when the overflow tier is empty or its bounds are cached.
+    /// Returns the highest `(price, quantity)` level, or `None` if empty.
     #[inline(always)]
     pub fn max(&self) -> Option<(u32, u64)> {
-        let preempt = unsafe { &*self.preempt.get() };
-        if !preempt.is_empty() {
-            if !self.preempt_bounds_valid.get() {
-                self.update_preempt_bounds();
-            }
-            let k = self.preempt_max.get();
-            return Some((k, *preempt.get(&k).unwrap()));
+        match self.preempt_keys.last() {
+            Some(&k) => Some((k, preempt_qty(&self.preempt, k))),
+            None => self.glass_max(),
         }
-        self.glass_max()
     }
 
+    // Once the trie is REFILL_BATCH levels short, pull up to REFILL_BATCH of
+    // the lowest preempt levels back (paper §4.5). Called at the end of every
+    // mutating operation that can leave the trie short. Correctness only
+    // needs trie keys < thres, not a full trie.
     #[inline(always)]
-    fn update_preempt_bounds(&self) {
-        unsafe {
-            let preempt = &*self.preempt.get();
-            if preempt.is_empty() {
-                self.thres.set(u32::MAX);
-                self.preempt_min.set(u32::MAX);
-                self.preempt_max.set(0);
-            } else {
-                let mut new_min = u32::MAX;
-                let mut new_max = 0;
-                for &k in preempt.keys() {
-                    if k < new_min {
-                        new_min = k;
-                    }
-                    if k > new_max {
-                        new_max = k;
-                    }
-                }
-                self.thres.set(new_min);
-                self.preempt_min.set(new_min);
-                self.preempt_max.set(new_max);
-            }
+    fn refill_if_low(&mut self) {
+        if self.glass_size() <= MAX_SIZE - REFILL_BATCH && !self.preempt_keys.is_empty() {
+            self.restructure();
         }
-        self.preempt_bounds_valid.set(true);
     }
 
+    // Moves up to REFILL_BATCH of the lowest preempt levels into the trie (no
+    // further than full). u32::MAX can never satisfy `key < thres` (thres
+    // saturates at u32::MAX, the paper's "infinity"), so it stays in the
+    // preempt tier to remain routable; being the largest key, it is the last
+    // one reached.
     #[inline(always)]
     fn restructure(&mut self) {
-        let sigma = self.glass_size();
-        if sigma >= MAX_SIZE {
-            return;
-        }
-        let n = MAX_SIZE - sigma;
-
-        self.ensure_sorted_preempt_keys();
-        let mut to_move = vec![];
-        unsafe {
-            let preempt = &mut *self.preempt.get();
-            let keys = &mut *self.sorted_preempt_keys.get();
-            let mut take = n.min(keys.len());
-            // u32::MAX can never satisfy `key < thres` (thres saturates at
-            // u32::MAX, the paper's "infinity"), so it must stay in the
-            // preempt tier to remain routable. Sorted, so it can only be last.
-            if take > 0 && keys[take - 1] == u32::MAX {
-                take -= 1;
+        let mut room = MAX_SIZE.saturating_sub(self.glass_size()).min(REFILL_BATCH);
+        while room > 0 {
+            let Some(&k) = self.preempt_keys.first() else {
+                break;
+            };
+            if k == u32::MAX {
+                break;
             }
-            for &k in keys.iter().take(take) {
-                if let Some(v) = preempt.remove(&k) {
-                    to_move.push((k, v));
-                }
-            }
-            keys.drain(..take);
-            // The drained sorted list is exact, so the bounds are too.
-            if keys.is_empty() {
-                self.thres.set(u32::MAX);
-                self.preempt_min.set(u32::MAX);
-                self.preempt_max.set(0);
-            } else {
-                let new_min = keys[0];
-                let new_max = *keys.last().unwrap();
-                self.thres.set(new_min);
-                self.preempt_min.set(new_min);
-                self.preempt_max.set(new_max);
-            }
-        }
-        self.preempt_bounds_valid.set(true);
-        self.preempt_dirty.set(false);
-        for (k, v) in to_move {
+            self.preempt_keys.pop_first();
+            let v = match self.preempt.remove(&k) {
+                Some(v) => v,
+                None => invariant_violated("preempt key index names a key missing from the map"),
+            };
             self.glass_insert(k, v);
+            room -= 1;
         }
+        self.refresh_thres();
     }
 
-    // Sum of quantities and slot-weighted quantities of a leaf. Empty slots
-    // hold 0, so no mask filtering is needed: the whole-leaf cost is
-    // base * sum(qty) + sum(slot * qty).
+    // Exact `(sum(qty), min(sum(slot * qty), u64::MAX))` of a leaf, or `None`
+    // when sum(qty) does not fit in u64 (the leaf then holds more than any
+    // u64 order can take, so callers fall back to the per-slot walk). Empty
+    // slots hold 0, so no mask filtering is needed: the whole-leaf cost is
+    // base * sum(qty) + sum(slot * qty). The fast path sums with wrapping
+    // arithmetic, which is exact while every quantity is below
+    // LEAF_SUM_EXACT_BOUND; the rare leaf holding a larger quantity is
+    // re-summed in u128 out of line.
     #[inline(always)]
-    fn leaf_sums(&self, values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
+    fn leaf_sums(&self, values: &[u64; NUM_CHILDREN]) -> Option<(u64, u64)> {
         #[cfg(all(target_arch = "x86_64", not(miri)))]
-        if self.has_avx512 {
-            return unsafe { leaf_sums_avx512(values) };
+        let (qty, weighted) = if self.has_avx512 {
+            unsafe { leaf_sums_avx512(values) }
+        } else if self.has_avx2 {
+            unsafe { leaf_sums_avx2(values) }
+        } else {
+            leaf_sums_scalar(values)
+        };
+        #[cfg(not(all(target_arch = "x86_64", not(miri))))]
+        let (qty, weighted) = leaf_sums_scalar(values);
+        if likely(qty != LEAF_SUM_INEXACT) {
+            Some((qty, weighted))
+        } else {
+            leaf_sums_wide(values)
         }
-        leaf_sums_scalar(values)
     }
 
     #[inline(always)]
-    #[cfg_attr(not(all(target_arch = "x86_64", not(miri))), allow(unused_variables))]
     fn prefetch_leaf(&self, leaf_idx: u32) {
-        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        // A prefetch never faults, so no bounds check: only skip the null
+        // sentinel (a constant compare) to avoid a pointless wild prefetch.
         if leaf_idx != u32::MAX {
-            unsafe {
-                _mm_prefetch(
-                    std::ptr::from_ref(&self.leaf_arena[leaf_idx as usize]) as *const i8,
-                    _MM_HINT_T0,
-                );
-            }
+            prefetch_read(
+                self.leaf_arena.as_ptr().wrapping_add(leaf_idx as usize),
+                Locality::L1,
+            );
         }
     }
 
-    // Exclusive-ownership prefetch (prefetchw) for a leaf that is about to be
-    // written: the line arrives in Modified/Exclusive state, avoiding the
-    // read-then-RFO upgrade that a plain T0 hint would pay.
+    // Write-intent prefetch for a leaf about to be consumed. This is
+    // `prefetchw` (line arrives owned, skipping the later RFO) only when the
+    // build enables `prfchw`, e.g. `-C target-cpu=native`; on baseline x86-64
+    // LLVM lowers it to the same `prefetcht0` as `prefetch_leaf`.
     #[inline(always)]
-    #[cfg_attr(not(all(target_arch = "x86_64", not(miri))), allow(unused_variables))]
     fn prefetch_leaf_w(&self, leaf_idx: u32) {
-        #[cfg(all(target_arch = "x86_64", not(miri)))]
         if leaf_idx != u32::MAX {
-            unsafe {
-                _mm_prefetch(
-                    std::ptr::from_ref(&self.leaf_arena[leaf_idx as usize]) as *const i8,
-                    _MM_HINT_ET0,
-                );
-            }
+            let leaf = self.leaf_arena.as_ptr().wrapping_add(leaf_idx as usize);
+            prefetch_write(leaf.cast_mut(), Locality::L1);
         }
     }
 
@@ -1076,24 +1049,24 @@ impl Glass {
 
         while shares_to_buy > 0 {
             if self.glass_size() == 0 {
-                if unsafe { (*self.preempt.get()).is_empty() } {
-                    break;
-                }
-                self.restructure();
-                if self.glass_size() > 0 {
-                    continue;
-                }
-                // Only the pinned u32::MAX level can be left in the preempt
-                // tier (restructure never moves it into the glass).
-                let avail = unsafe { (*self.preempt.get()).get(&u32::MAX).copied() };
-                let Some(avail) = avail else { break };
-                let buy = avail.min(shares_to_buy);
-                total_cost = total_cost.saturating_add((u32::MAX as u64).saturating_mul(buy));
-                if buy == avail {
-                    self.preempt_remove(u32::MAX);
-                } else {
-                    unsafe {
-                        *(*self.preempt.get()).get_mut(&u32::MAX).unwrap() -= buy;
+                // Trie exhausted. Every preempt key is above every trie key,
+                // so fill the rest of the order straight from the preempt tier
+                // in key order (the pinned u32::MAX level included) instead of
+                // refilling the trie first: work stays proportional to the
+                // levels consumed, with no refill burst.
+                while shares_to_buy > 0 {
+                    let Some(&k) = self.preempt_keys.first() else {
+                        break;
+                    };
+                    let Some(avail) = self.preempt.get_mut(&k) else {
+                        invariant_violated("preempt key index names a key missing from the map");
+                    };
+                    let take = (*avail).min(shares_to_buy);
+                    total_cost = total_cost.saturating_add((k as u64).saturating_mul(take));
+                    shares_to_buy -= take;
+                    *avail -= take;
+                    if *avail == 0 {
+                        self.preempt_remove(k);
                     }
                 }
                 break;
@@ -1111,9 +1084,11 @@ impl Glass {
             // The successor leaf will be consumed (written) next in a deep
             // sweep — fetch it with intent to write.
             self.prefetch_leaf_w(next_leaf);
-            let (qty_total, weighted) = self.leaf_sums(&self.leaf_arena[leaf_idx as usize].values);
-
-            if qty_total <= shares_to_buy {
+            // `None` means the leaf holds more than any u64 order: partial.
+            if let Some((qty_total, weighted)) =
+                self.leaf_sums(&self.leaf_arena[leaf_idx as usize].values)
+                && qty_total <= shares_to_buy
+            {
                 // Consume the entire leaf.
                 total_cost = total_cost
                     .saturating_add(base.saturating_mul(qty_total))
@@ -1123,20 +1098,21 @@ impl Glass {
             } else {
                 // Partial: walk set bits from the cheapest slot up.
                 let leaf = &mut self.leaf_arena[leaf_idx as usize];
-                let mut m = mask;
                 let mut consumed_slots = 0u32;
                 while shares_to_buy > 0 {
-                    // plain trailing_zeros: self is mutably borrowed via `leaf`
-                    let slot = m.trailing_zeros() as usize;
+                    // The leaf holds more than the order, so a set bit remains.
+                    if unlikely(leaf.mask == 0) {
+                        invariant_violated("partial buy ran out of levels in its leaf");
+                    }
+                    let slot = tz64(leaf.mask);
                     let price = base | slot as u64;
                     let qty = leaf.values[slot];
                     if qty <= shares_to_buy {
                         total_cost = total_cost.saturating_add(price.saturating_mul(qty));
                         shares_to_buy -= qty;
                         leaf.values[slot] = 0;
-                        leaf.mask &= !(1u64 << slot);
+                        leaf.mask = clear_lowest_bit(leaf.mask);
                         consumed_slots += 1;
-                        m &= m - 1;
                     } else {
                         total_cost = total_cost.saturating_add(price.saturating_mul(shares_to_buy));
                         leaf.values[slot] -= shares_to_buy;
@@ -1144,7 +1120,7 @@ impl Glass {
                     }
                 }
                 let partial = (base >> BITS_PER_LEVEL) as u32;
-                let new_min_slot = self.tz64(self.leaf_arena[leaf_idx as usize].mask) as u32;
+                let new_min_slot = tz64(self.leaf_arena[leaf_idx as usize].mask) as u32;
                 self.min_key.set((base as u32) | new_min_slot);
                 if consumed_slots > 0 {
                     self.decrement_ancestor_counts(partial, consumed_slots);
@@ -1153,9 +1129,7 @@ impl Glass {
             }
         }
 
-        if self.glass_size() < MAX_SIZE && !unsafe { (*self.preempt.get()).is_empty() } {
-            self.restructure();
-        }
+        self.refill_if_low();
         total_cost
     }
 
@@ -1163,13 +1137,14 @@ impl Glass {
     // occupancy mask is `mask`. Ancestor counts, the leaf list, the intrusive
     // hash table, min/max bookkeeping and the cached path are all maintained.
     fn remove_min_leaf(&mut self, leaf_idx: u32, mask: u64) {
-        let n = self.popcnt64(mask);
+        let n = mask.count_ones();
         let (partial, next_l) = {
             let leaf = &mut self.leaf_arena[leaf_idx as usize];
             let p = leaf.ht_k;
             let nl = leaf.next_leaf;
+            // No need to zero `values`: the free list re-initializes a
+            // reused leaf with `LeafNode::new()`.
             leaf.mask = 0;
-            leaf.values = [0; NUM_CHILDREN];
             (p, nl)
         };
 
@@ -1182,7 +1157,7 @@ impl Glass {
         self.min_leaf.set(next_l);
         if next_l != u32::MAX {
             let nleaf = &self.leaf_arena[next_l as usize];
-            let slot = self.tz64(nleaf.mask) as u32;
+            let slot = tz64(nleaf.mask) as u32;
             self.min_key.set((nleaf.ht_k << BITS_PER_LEVEL) | slot);
         } else {
             self.min_key.set(u32::MAX);
@@ -1192,13 +1167,14 @@ impl Glass {
 
     // Mirror of remove_min_leaf for the maximum leaf (sell-side consumption).
     fn remove_max_leaf(&mut self, leaf_idx: u32, mask: u64) {
-        let n = self.popcnt64(mask);
+        let n = mask.count_ones();
         let (partial, prev_l) = {
             let leaf = &mut self.leaf_arena[leaf_idx as usize];
             let p = leaf.ht_k;
             let pl = leaf.prev_leaf;
+            // No need to zero `values`: the free list re-initializes a
+            // reused leaf with `LeafNode::new()`.
             leaf.mask = 0;
-            leaf.values = [0; NUM_CHILDREN];
             (p, pl)
         };
 
@@ -1211,7 +1187,7 @@ impl Glass {
         self.max_leaf.set(prev_l);
         if prev_l != u32::MAX {
             let pleaf = &self.leaf_arena[prev_l as usize];
-            let slot = self.high_bit(pleaf.mask) as u32;
+            let slot = high_bit(pleaf.mask) as u32;
             self.max_key.set((pleaf.ht_k << BITS_PER_LEVEL) | slot);
         } else {
             self.max_key.set(0);
@@ -1228,7 +1204,7 @@ impl Glass {
         self.leaf_free_list.push(leaf_idx);
 
         let mut path: [(u32, usize); NUM_LEVELS - 1] = [(0, 0); NUM_LEVELS - 1];
-        let mut node_idx = self.root;
+        let mut node_idx = ROOT;
         for (l, entry) in path.iter_mut().enumerate() {
             let shift = (NUM_LEVELS - 2 - l) * BITS_PER_LEVEL;
             let slot = ((partial >> shift) & 0x3F) as usize;
@@ -1238,16 +1214,7 @@ impl Glass {
             node_idx = next;
         }
         debug_assert_eq!(node_idx, leaf_idx);
-        for l in (0..NUM_LEVELS - 1).rev() {
-            let (parent, slot) = path[l];
-            self.arena[parent as usize].children[slot] = u32::MAX;
-            self.arena[parent as usize].mask &= !(1u64 << slot);
-            if self.arena[parent as usize].mask == 0 && l > 0 {
-                self.free_list.push(parent);
-            } else {
-                break;
-            }
-        }
+        self.prune_empty_path(&path);
 
         // Cached path entries may point into the freed subtree only when the
         // cached key shared this leaf (shared shallower ancestors survive:
@@ -1260,9 +1227,25 @@ impl Glass {
         }
     }
 
+    // Unlinks the emptied leaf at the end of `path` (the (node, child slot)
+    // pairs from the root down) and frees every ancestor left with no
+    // children. The root is never freed.
+    #[inline(always)]
+    fn prune_empty_path(&mut self, path: &[(u32, usize); NUM_LEVELS - 1]) {
+        for (l, &(node_idx, slot)) in path.iter().enumerate().rev() {
+            let node = &mut self.arena[node_idx as usize];
+            node.children[slot] = u32::MAX;
+            node.mask &= !(1u64 << slot);
+            if node.mask != 0 || l == 0 {
+                break;
+            }
+            self.free_list.push(node_idx);
+        }
+    }
+
     #[inline(always)]
     fn decrement_ancestor_counts(&mut self, partial: u32, n: u32) {
-        let mut node_idx = self.root;
+        let mut node_idx = ROOT;
         for l in 0..NUM_LEVELS - 1 {
             let shift = (NUM_LEVELS - 2 - l) * BITS_PER_LEVEL;
             let slot = ((partial >> shift) & 0x3F) as usize;
@@ -1288,8 +1271,9 @@ impl Glass {
             if !first {
                 // Deep sweep: prefetch the successor while summing this leaf.
                 self.prefetch_leaf(leaf.next_leaf);
-                let (qty_total, weighted) = self.leaf_sums(&leaf.values);
-                if qty_total <= target_shares {
+                if let Some((qty_total, weighted)) = self.leaf_sums(&leaf.values)
+                    && qty_total <= target_shares
+                {
                     total_cost = total_cost
                         .saturating_add(base.saturating_mul(qty_total))
                         .saturating_add(weighted);
@@ -1302,7 +1286,7 @@ impl Glass {
 
             let mut mask = leaf.mask;
             while mask != 0 {
-                let slot = self.tz64(mask);
+                let slot = tz64(mask);
 
                 let price = base | slot as u64;
                 let qty = leaf.values[slot];
@@ -1314,23 +1298,18 @@ impl Glass {
                     return total_cost;
                 }
 
-                mask = self.clear_lowest_bit(mask);
+                mask = clear_lowest_bit(mask);
             }
             curr_leaf_idx = leaf.next_leaf;
         }
 
-        if target_shares > 0 {
-            self.ensure_sorted_preempt_keys();
-            let sorted_keys = unsafe { &*self.sorted_preempt_keys.get() };
-            for &k in sorted_keys {
-                if target_shares == 0 {
-                    break;
-                }
-                let avail_shares = *unsafe { (*self.preempt.get()).get(&k).unwrap() };
-                let buy = avail_shares.min(target_shares);
-                total_cost = total_cost.saturating_add((k as u64).saturating_mul(buy));
-                target_shares -= buy;
+        for &k in &self.preempt_keys {
+            if target_shares == 0 {
+                break;
             }
+            let buy = preempt_qty(&self.preempt, k).min(target_shares);
+            total_cost = total_cost.saturating_add((k as u64).saturating_mul(buy));
+            target_shares -= buy;
         }
         total_cost
     }
@@ -1341,7 +1320,7 @@ impl Glass {
     /// when this glass holds the bid side of a book.
     ///
     /// The overflow tier holds the highest prices, so it is drained first
-    /// (sorted, from the top), then trie leaves are consumed whole from the
+    /// (from the top of its key index), then trie leaves are consumed whole from the
     /// max leaf backward. Note the preemption design keeps the *lowest* keys
     /// in the fast trie; for a sell-heavy workload against a book deeper than
     /// 4096 levels, consider storing negated prices (`!price`) and using the
@@ -1350,39 +1329,19 @@ impl Glass {
         let mut total_proceeds = 0u64;
 
         // 1. Overflow tier, highest price first.
-        if shares_to_sell > 0 && !unsafe { (*self.preempt.get()).is_empty() } {
-            self.ensure_sorted_preempt_keys();
-            unsafe {
-                let preempt = &mut *self.preempt.get();
-                let keys = &mut *self.sorted_preempt_keys.get();
-                while shares_to_sell > 0 {
-                    let Some(&k) = keys.last() else { break };
-                    let avail = *preempt.get(&k).unwrap();
-                    if avail <= shares_to_sell {
-                        total_proceeds =
-                            total_proceeds.saturating_add((k as u64).saturating_mul(avail));
-                        shares_to_sell -= avail;
-                        preempt.remove(&k);
-                        keys.pop();
-                    } else {
-                        total_proceeds = total_proceeds
-                            .saturating_add((k as u64).saturating_mul(shares_to_sell));
-                        *preempt.get_mut(&k).unwrap() -= shares_to_sell;
-                        shares_to_sell = 0;
-                    }
-                }
-                // The drained sorted list stays exact, so set bounds exactly.
-                if keys.is_empty() {
-                    self.thres.set(u32::MAX);
-                    self.preempt_min.set(u32::MAX);
-                    self.preempt_max.set(0);
-                } else {
-                    let new_min = keys[0];
-                    self.thres.set(new_min);
-                    self.preempt_min.set(new_min);
-                    self.preempt_max.set(*keys.last().unwrap());
-                }
-                self.preempt_bounds_valid.set(true);
+        while shares_to_sell > 0 {
+            let Some(&k) = self.preempt_keys.last() else {
+                break;
+            };
+            let Some(avail) = self.preempt.get_mut(&k) else {
+                invariant_violated("preempt key index names a key missing from the map");
+            };
+            let take = (*avail).min(shares_to_sell);
+            total_proceeds = total_proceeds.saturating_add((k as u64).saturating_mul(take));
+            shares_to_sell -= take;
+            *avail -= take;
+            if *avail == 0 {
+                self.preempt_remove(k);
             }
         }
 
@@ -1399,9 +1358,11 @@ impl Glass {
             };
             // The predecessor leaf will be consumed (written) next.
             self.prefetch_leaf_w(prev_leaf);
-            let (qty_total, weighted) = self.leaf_sums(&self.leaf_arena[leaf_idx as usize].values);
-
-            if qty_total <= shares_to_sell {
+            // `None` means the leaf holds more than any u64 order: partial.
+            if let Some((qty_total, weighted)) =
+                self.leaf_sums(&self.leaf_arena[leaf_idx as usize].values)
+                && qty_total <= shares_to_sell
+            {
                 // Consume the entire leaf.
                 total_proceeds = total_proceeds
                     .saturating_add(base.saturating_mul(qty_total))
@@ -1413,8 +1374,11 @@ impl Glass {
                 let leaf = &mut self.leaf_arena[leaf_idx as usize];
                 let mut consumed_slots = 0u32;
                 while shares_to_sell > 0 {
-                    // plain leading_zeros: self is mutably borrowed via `leaf`
-                    let slot = 63 - leaf.mask.leading_zeros() as usize;
+                    // The leaf holds more than the order, so a set bit remains.
+                    if unlikely(leaf.mask == 0) {
+                        invariant_violated("partial sell ran out of levels in its leaf");
+                    }
+                    let slot = high_bit(leaf.mask);
                     let price = base | slot as u64;
                     let qty = leaf.values[slot];
                     if qty <= shares_to_sell {
@@ -1431,7 +1395,7 @@ impl Glass {
                     }
                 }
                 let partial = (base >> BITS_PER_LEVEL) as u32;
-                let new_max_slot = self.high_bit(self.leaf_arena[leaf_idx as usize].mask) as u32;
+                let new_max_slot = high_bit(self.leaf_arena[leaf_idx as usize].mask) as u32;
                 self.max_key.set((base as u32) | new_max_slot);
                 if consumed_slots > 0 {
                     self.decrement_ancestor_counts(partial, consumed_slots);
@@ -1439,6 +1403,7 @@ impl Glass {
                 break;
             }
         }
+        self.refill_if_low();
         total_proceeds
     }
 
@@ -1449,21 +1414,13 @@ impl Glass {
         let mut total_proceeds = 0u64;
 
         // Overflow tier first: it holds the highest prices.
-        {
-            let preempt = unsafe { &*self.preempt.get() };
-            if !preempt.is_empty() {
-                self.ensure_sorted_preempt_keys();
-                let keys = unsafe { &*self.sorted_preempt_keys.get() };
-                for &k in keys.iter().rev() {
-                    if target_shares == 0 {
-                        return total_proceeds;
-                    }
-                    let avail = *preempt.get(&k).unwrap();
-                    let take = avail.min(target_shares);
-                    total_proceeds = total_proceeds.saturating_add((k as u64).saturating_mul(take));
-                    target_shares -= take;
-                }
+        for &k in self.preempt_keys.iter().rev() {
+            if target_shares == 0 {
+                return total_proceeds;
             }
+            let take = preempt_qty(&self.preempt, k).min(target_shares);
+            total_proceeds = total_proceeds.saturating_add((k as u64).saturating_mul(take));
+            target_shares -= take;
         }
 
         // Glass tier from the max leaf downward. Same adaptive shape as the
@@ -1476,8 +1433,9 @@ impl Glass {
 
             if !first {
                 self.prefetch_leaf(leaf.prev_leaf);
-                let (qty_total, weighted) = self.leaf_sums(&leaf.values);
-                if qty_total <= target_shares {
+                if let Some((qty_total, weighted)) = self.leaf_sums(&leaf.values)
+                    && qty_total <= target_shares
+                {
                     total_proceeds = total_proceeds
                         .saturating_add(base.saturating_mul(qty_total))
                         .saturating_add(weighted);
@@ -1490,7 +1448,7 @@ impl Glass {
 
             let mut mask = leaf.mask;
             while mask != 0 {
-                let slot = self.high_bit(mask);
+                let slot = high_bit(mask);
                 let price = base | slot as u64;
                 let qty = leaf.values[slot];
                 let take = qty.min(target_shares);
@@ -1519,7 +1477,7 @@ impl Glass {
         let partial = key >> BITS_PER_LEVEL;
 
         let mut level = 0usize;
-        let mut node_idx = self.root;
+        let mut node_idx = ROOT;
         let mut leaf_idx = u32::MAX;
 
         if let Some(l_idx) = self.find_leaf(partial) {
@@ -1531,12 +1489,12 @@ impl Glass {
                 let depth = self.get_common_prefix_depth(key, lk);
                 level = (self.cached_d.get() as usize).min(depth);
                 if level > 0 && level < NUM_LEVELS - 1 {
-                    node_idx = unsafe { (*self.cached_path.get())[level] };
+                    node_idx = self.cached_path[level].get();
                 }
             }
 
             for l in level..NUM_LEVELS - 1 {
-                unsafe { (*self.cached_path.get())[l] = node_idx };
+                self.cached_path[l].set(node_idx);
                 let shift = (NUM_LEVELS - 1 - l) * BITS_PER_LEVEL;
                 let child_slot = ((key >> shift) & 0x3F) as usize;
                 node_idx = self.arena[node_idx as usize].children[child_slot];
@@ -1546,7 +1504,7 @@ impl Glass {
             if leaf.values[leaf_slot] == 0 {
                 leaf.mask |= 1u64 << leaf_slot;
                 for l in 0..NUM_LEVELS - 1 {
-                    let ancestor_idx = unsafe { (*self.cached_path.get())[l] };
+                    let ancestor_idx = self.cached_path[l].get();
                     self.arena[ancestor_idx as usize].count += 1;
                 }
             }
@@ -1572,7 +1530,7 @@ impl Glass {
             level = (self.cached_d.get() as usize).min(depth);
             if level > 0 {
                 if level < NUM_LEVELS - 1 {
-                    node_idx = unsafe { (*self.cached_path.get())[level] };
+                    node_idx = self.cached_path[level].get();
                 } else {
                     leaf_idx = self.cached_leaf.get();
                 }
@@ -1600,7 +1558,6 @@ impl Glass {
                     let (prev_l, next_l) = self.find_neighbor_leaves(key);
                     {
                         let new_leaf = &mut self.leaf_arena[new_leaf_idx as usize];
-                        new_leaf.parent = node_idx;
                         new_leaf.prev_leaf = prev_l;
                         new_leaf.next_leaf = next_l;
                     }
@@ -1617,7 +1574,7 @@ impl Glass {
 
                     self.ht_insert(new_leaf_idx, partial);
                 }
-                unsafe { (*self.cached_path.get())[l] = node_idx };
+                self.cached_path[l].set(node_idx);
                 leaf_idx = self.arena[node_idx as usize].children[child_slot];
             } else {
                 if self.arena[node_idx as usize].children[child_slot] == u32::MAX {
@@ -1629,11 +1586,10 @@ impl Glass {
                         self.arena.push(InternalNode::new());
                         idx
                     };
-                    self.arena[new_idx as usize].parent = node_idx;
                     self.arena[node_idx as usize].children[child_slot] = new_idx;
                     self.arena[node_idx as usize].mask |= 1u64 << child_slot;
                 }
-                unsafe { (*self.cached_path.get())[l] = node_idx };
+                self.cached_path[l].set(node_idx);
                 node_idx = self.arena[node_idx as usize].children[child_slot];
             }
         }
@@ -1644,7 +1600,7 @@ impl Glass {
         if leaf.values[leaf_slot] == 0 {
             leaf.mask |= 1u64 << leaf_slot;
             for l in 0..NUM_LEVELS - 1 {
-                let ancestor_idx = unsafe { (*self.cached_path.get())[l] };
+                let ancestor_idx = self.cached_path[l].get();
                 self.arena[ancestor_idx as usize].count += 1;
             }
         }
@@ -1664,34 +1620,42 @@ impl Glass {
         }
     }
 
+    // From internal node `node_idx` at trie level `level`, descend to its
+    // rightmost (`rightmost`) or leftmost leaf. Every node on a live path has
+    // a non-empty mask.
+    #[inline(always)]
+    fn descend_to_edge_leaf(&self, mut node_idx: u32, level: usize, rightmost: bool) -> u32 {
+        for _ in level..NUM_LEVELS - 1 {
+            let node = &self.arena[node_idx as usize];
+            let slot = if rightmost {
+                find_prev_set_bit(node.mask, NUM_CHILDREN)
+            } else {
+                find_next_set_bit(node.mask, 0)
+            };
+            let Some(slot) = slot else {
+                invariant_violated("empty internal node on a live trie path");
+            };
+            node_idx = node.children[slot];
+        }
+        node_idx
+    }
+
     #[inline(always)]
     fn find_neighbor_leaves(&self, key: u32) -> (u32, u32) {
         let mut prev = u32::MAX;
         let mut next = u32::MAX;
 
-        let mut node_idx = self.root;
+        let mut node_idx = ROOT;
         for depth in 0..NUM_LEVELS - 1 {
             let node = &self.arena[node_idx as usize];
             let shift = (NUM_LEVELS - 1 - depth) * BITS_PER_LEVEL;
             let slot = ((key >> shift) & 0x3F) as usize;
 
-            if let Some(p_slot) = self.find_prev_set_bit(node.mask, slot) {
-                let mut curr = node.children[p_slot];
-                for _d2 in depth + 1..NUM_LEVELS - 1 {
-                    let n2 = &self.arena[curr as usize];
-                    let s2 = self.find_prev_set_bit(n2.mask, NUM_CHILDREN).unwrap();
-                    curr = n2.children[s2];
-                }
-                prev = curr;
+            if let Some(p_slot) = find_prev_set_bit(node.mask, slot) {
+                prev = self.descend_to_edge_leaf(node.children[p_slot], depth + 1, true);
             }
-            if let Some(n_slot) = self.find_next_set_bit(node.mask, slot + 1) {
-                let mut curr = node.children[n_slot];
-                for _d2 in depth + 1..NUM_LEVELS - 1 {
-                    let n2 = &self.arena[curr as usize];
-                    let s2 = self.find_next_set_bit(n2.mask, 0).unwrap();
-                    curr = n2.children[s2];
-                }
-                next = curr;
+            if let Some(n_slot) = find_next_set_bit(node.mask, slot + 1) {
+                next = self.descend_to_edge_leaf(node.children[n_slot], depth + 1, false);
             }
 
             let next_node = node.children[slot];
@@ -1737,7 +1701,7 @@ impl Glass {
             return None;
         }
 
-        let mut node_idx = self.root;
+        let mut node_idx = ROOT;
         let mut path: [(u32, usize); NUM_LEVELS - 1] = [(0, 0); NUM_LEVELS - 1];
         for (l, entry) in path.iter_mut().enumerate() {
             let shift = (NUM_LEVELS - 1 - l) * BITS_PER_LEVEL;
@@ -1769,16 +1733,7 @@ impl Glass {
 
             self.ht_remove(leaf_idx);
             self.leaf_free_list.push(leaf_idx);
-            for l in (0..NUM_LEVELS - 1).rev() {
-                let (parent, slot) = path[l];
-                self.arena[parent as usize].children[slot] = u32::MAX;
-                self.arena[parent as usize].mask &= !(1u64 << slot);
-                if self.arena[parent as usize].mask == 0 && l > 0 {
-                    self.free_list.push(parent);
-                } else {
-                    break;
-                }
-            }
+            self.prune_empty_path(&path);
         }
 
         if self.cached_last_key.get() == Some(key) {
@@ -1804,58 +1759,72 @@ impl Glass {
         Some(removed_val)
     }
 
+    // The k-th smallest trie key: descend by subtree counts, then select the
+    // k-th set bit of the leaf. The counting paths (popcount per leaf child,
+    // then the select) are compiled as whole `target_feature` kernels:
+    // on baseline x86-64 `count_ones` is a ~12-instruction software popcount,
+    // and a dispatched intrinsic would be an out-of-line call per bit op.
     #[inline(always)]
-    fn glass_find_kth_key(&self, mut k: usize) -> Option<u32> {
+    fn glass_find_kth_key(&self, k: usize) -> Option<u32> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.has_fast_pdep {
+                return unsafe { self.glass_find_kth_key_bmi2(k) };
+            }
+            if self.has_popcnt {
+                return unsafe { self.glass_find_kth_key_popcnt(k) };
+            }
+        }
+        self.glass_find_kth_key_impl::<false>(k)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt,bmi1,bmi2")]
+    fn glass_find_kth_key_bmi2(&self, k: usize) -> Option<u32> {
+        self.glass_find_kth_key_impl::<true>(k)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt")]
+    fn glass_find_kth_key_popcnt(&self, k: usize) -> Option<u32> {
+        self.glass_find_kth_key_impl::<false>(k)
+    }
+
+    #[inline(always)]
+    fn glass_find_kth_key_impl<const PDEP: bool>(&self, mut k: usize) -> Option<u32> {
         if k >= self.glass_size() {
             return None;
         }
-        let mut node_idx = self.root;
+        let mut node_idx = ROOT;
         let mut key = 0u32;
         for depth in 0..NUM_LEVELS - 1 {
             let node = &self.arena[node_idx as usize];
             let mut start = 0;
             loop {
-                {
-                    let slot = self.find_next_set_bit(node.mask, start)?;
-                    let child_idx = node.children[slot];
-                    let count = if depth == NUM_LEVELS - 2 {
-                        self.popcnt64(self.leaf_arena[child_idx as usize].mask) as usize
-                    } else {
-                        self.arena[child_idx as usize].count as usize
-                    };
-                    if k < count {
-                        key |= (slot as u32) << ((NUM_LEVELS - 1 - depth) * BITS_PER_LEVEL);
-                        node_idx = child_idx;
-                        break;
-                    } else {
-                        k -= count;
-                    }
-                    start = slot + 1;
+                let slot = find_next_set_bit(node.mask, start)?;
+                let child_idx = node.children[slot];
+                let count = if depth == NUM_LEVELS - 2 {
+                    self.leaf_arena[child_idx as usize].mask.count_ones() as usize
+                } else {
+                    self.arena[child_idx as usize].count as usize
+                };
+                if k < count {
+                    key |= (slot as u32) << ((NUM_LEVELS - 1 - depth) * BITS_PER_LEVEL);
+                    node_idx = child_idx;
+                    break;
                 }
+                k -= count;
+                start = slot + 1;
             }
         }
         let leaf = &self.leaf_arena[node_idx as usize];
         // The descent guarantees k < popcount(leaf.mask).
-        Some(key | self.select_kth_set_bit(leaf.mask, k as u32) as u32)
-    }
-
-    // Index of the k-th (0-based) set bit of `mask`; requires
-    // k < popcount(mask). PDEP deposits a unit bit into the k-th set
-    // position, turning an up-to-64-iteration scan into two instructions.
-    // Runtime-gated on BMI2: PDEP is 3 cycles on Intel and Zen 3+, but
-    // microcoded (hundreds of cycles) on older AMD, where the fallback loop
-    // is preferable anyway.
-    #[inline(always)]
-    fn select_kth_set_bit(&self, mask: u64, k: u32) -> usize {
         #[cfg(target_arch = "x86_64")]
-        if self.has_bmi2 {
-            return unsafe { _tzcnt_u64(_pdep_u64(1u64 << k, mask)) as usize };
+        if PDEP {
+            // SAFETY: only instantiated inside the bmi1+bmi2 kernel.
+            return Some(key | unsafe { select_kth_set_bit_pdep(leaf.mask, k as u32) } as u32);
         }
-        let mut m = mask;
-        for _ in 0..k {
-            m &= m.wrapping_sub(1);
-        }
-        m.trailing_zeros() as usize
+        Some(key | select_kth_set_bit(leaf.mask, k as u32) as u32)
     }
 
     #[inline(always)]
@@ -1863,11 +1832,8 @@ impl Glass {
         let leaf_idx = self.min_leaf.get();
         if leaf_idx != u32::MAX {
             let leaf = &self.leaf_arena[leaf_idx as usize];
-            let slot = self.tz64(leaf.mask);
-            return Some((
-                (leaf.ht_k << BITS_PER_LEVEL) | slot as u32,
-                leaf.values[slot],
-            ));
+            let slot = tz64(leaf.mask);
+            return Some(leaf.level(slot));
         }
         None
     }
@@ -1877,39 +1843,36 @@ impl Glass {
         let leaf_idx = self.max_leaf.get();
         if leaf_idx != u32::MAX {
             let leaf = &self.leaf_arena[leaf_idx as usize];
-            let slot = self.high_bit(leaf.mask);
-            return Some((
-                (leaf.ht_k << BITS_PER_LEVEL) | slot as u32,
-                leaf.values[slot],
-            ));
+            let slot = high_bit(leaf.mask);
+            return Some(leaf.level(slot));
         }
         None
     }
 
     #[inline(always)]
     fn glass_find_extreme(&self, is_min: bool) -> Option<(u32, u64)> {
-        if self.arena[self.root as usize].mask == 0 {
+        if self.arena[ROOT as usize].mask == 0 {
             return None;
         }
-        let mut node_idx = self.root;
+        let mut node_idx = ROOT;
         let mut key = 0u32;
         for depth in 0..NUM_LEVELS - 1 {
             let node = &self.arena[node_idx as usize];
             let idx = if is_min {
-                self.find_next_set_bit(node.mask, 0)
+                find_next_set_bit(node.mask, 0)
             } else {
-                self.find_prev_set_bit(node.mask, NUM_CHILDREN)
+                find_prev_set_bit(node.mask, NUM_CHILDREN)
             }?;
-            unsafe { (*self.cached_path.get())[depth] = node_idx };
+            self.cached_path[depth].set(node_idx);
             key |= (idx as u32) << ((NUM_LEVELS - 1 - depth) * BITS_PER_LEVEL);
             node_idx = node.children[idx];
         }
         let leaf_idx = node_idx;
         let leaf = &self.leaf_arena[leaf_idx as usize];
         let idx = if is_min {
-            self.find_next_set_bit(leaf.mask, 0)
+            find_next_set_bit(leaf.mask, 0)
         } else {
-            self.find_prev_set_bit(leaf.mask, NUM_CHILDREN)
+            find_prev_set_bit(leaf.mask, NUM_CHILDREN)
         }?;
         let price = key | idx as u32;
         self.cached_leaf.set(leaf_idx);
@@ -1924,99 +1887,129 @@ impl Glass {
         }
         Some((price, leaf.values[idx]))
     }
-
-    // Index of the lowest set bit; hardware tzcnt when available. `mask`
-    // must be non-zero on the BMI1 path callers use.
-    #[inline(always)]
-    fn tz64(&self, mask: u64) -> usize {
-        #[cfg(target_arch = "x86_64")]
-        if self.has_bmi1 {
-            return unsafe { _tzcnt_u64(mask) as usize };
-        }
-        mask.trailing_zeros() as usize
-    }
-
-    // Clears the lowest set bit (blsr).
-    #[inline(always)]
-    fn clear_lowest_bit(&self, mask: u64) -> u64 {
-        #[cfg(target_arch = "x86_64")]
-        if self.has_bmi1 {
-            return unsafe { _blsr_u64(mask) };
-        }
-        mask & mask.wrapping_sub(1)
-    }
-
-    // Population count. Without -C target-feature=+popcnt, count_ones()
-    // compiles to a software fallback on the baseline x86-64 target, so
-    // dispatch to the hardware instruction at runtime like the other scans.
-    #[inline(always)]
-    fn popcnt64(&self, mask: u64) -> u32 {
-        #[cfg(target_arch = "x86_64")]
-        if self.has_popcnt {
-            return unsafe { _popcnt64(mask as i64) as u32 };
-        }
-        mask.count_ones()
-    }
-
-    // Index of the highest set bit; hardware lzcnt when available. `mask`
-    // must be non-zero.
-    #[inline(always)]
-    fn high_bit(&self, mask: u64) -> usize {
-        #[cfg(target_arch = "x86_64")]
-        if self.has_lzcnt {
-            return unsafe { (63 - _lzcnt_u64(mask)) as usize };
-        }
-        63 - mask.leading_zeros() as usize
-    }
-
-    #[inline(always)]
-    fn find_next_set_bit(&self, mut mask: u64, start: usize) -> Option<usize> {
-        if start >= NUM_CHILDREN {
-            return None;
-        }
-        mask >>= start;
-        if mask == 0 {
-            return None;
-        }
-        Some(start + self.tz64(mask))
-    }
-
-    #[inline(always)]
-    fn find_prev_set_bit(&self, mut mask: u64, end: usize) -> Option<usize> {
-        if end == 0 {
-            return None;
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if self.has_bmi2 {
-                unsafe { mask = _bzhi_u64(mask, end as u32) };
-            } else if end < 64 {
-                mask &= (1u64 << end) - 1;
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        if end < 64 {
-            mask &= (1u64 << end) - 1;
-        }
-        if mask == 0 {
-            return None;
-        }
-        Some(self.high_bit(mask))
-    }
 }
 
-// (sum(qty), sum(slot * qty)) over all 64 slots; empty slots are 0 and
-// contribute nothing. Sums wrap on overflow (unreachable for realistic
-// order-book quantities); callers combine results with saturating arithmetic.
+// Bit scans use the plain integer methods on purpose. The crate is built for
+// baseline x86-64, where a BMI/LZCNT/POPCNT intrinsic cannot be inlined into
+// a non-`target_feature` caller: runtime-dispatching to one costs an
+// out-of-line call per scan. `trailing_zeros`/`leading_zeros` lower to inline
+// `bsf`/`bsr` (the zero check folds away where the caller already tested the
+// mask), which measured 29-46% fewer cycles on the cost estimators. Build with
+// `-C target-cpu=native` to get tzcnt/lzcnt/blsr/popcnt.
+
+// Index of the lowest set bit (64 for 0).
+#[inline(always)]
+fn tz64(mask: u64) -> usize {
+    mask.trailing_zeros() as usize
+}
+
+// Clears the lowest set bit.
+#[inline(always)]
+fn clear_lowest_bit(mask: u64) -> u64 {
+    mask & mask.wrapping_sub(1)
+}
+
+// Index of the highest set bit. `mask` must be non-zero.
+#[inline(always)]
+fn high_bit(mask: u64) -> usize {
+    63 - mask.leading_zeros() as usize
+}
+
+// Lowest set bit at or above `start`.
+#[inline(always)]
+fn find_next_set_bit(mask: u64, start: usize) -> Option<usize> {
+    if start >= NUM_CHILDREN {
+        return None;
+    }
+    let mask = mask >> start;
+    if mask == 0 {
+        return None;
+    }
+    Some(start + tz64(mask))
+}
+
+// Highest set bit below `end` (`end` <= 64).
+#[inline(always)]
+fn find_prev_set_bit(mut mask: u64, end: usize) -> Option<usize> {
+    if end < 64 {
+        mask &= (1u64 << end) - 1;
+    }
+    if mask == 0 {
+        return None;
+    }
+    Some(high_bit(mask))
+}
+
+// Every quantity below this bound makes a leaf's wrapping sums exact:
+// sum(qty) <= 64 * (2^52 - 1) < 2^58 and sum(slot * qty) <= 63 * sum(qty) < 2^64.
+const LEAF_SUM_EXACT_BOUND: u64 = 1 << 52;
+// Returned as sum(qty) when some quantity reaches LEAF_SUM_EXACT_BOUND (an
+// exact sum is below 2^58, so it cannot collide). Keeps the result of the
+// out-of-line AVX-512 call in two registers instead of a stack-returned triple.
+const LEAF_SUM_INEXACT: u64 = u64::MAX;
+
+// (sum(qty), sum(slot * qty)) over the 64 slots with wrapping sums, or
+// (LEAF_SUM_INEXACT, _) when a quantity reaches LEAF_SUM_EXACT_BOUND and the
+// sums might have wrapped (see `Glass::leaf_sums`). Empty slots are 0 and
+// contribute nothing.
 #[inline(always)]
 fn leaf_sums_scalar(values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
     let mut qty = 0u64;
     let mut weighted = 0u64;
+    let mut any = 0u64;
     for (i, &v) in values.iter().enumerate() {
         qty = qty.wrapping_add(v);
         weighted = weighted.wrapping_add((i as u64).wrapping_mul(v));
+        any |= v;
     }
-    (qty, weighted)
+    if any < LEAF_SUM_EXACT_BOUND {
+        (qty, weighted)
+    } else {
+        (LEAF_SUM_INEXACT, weighted)
+    }
+}
+
+// Exact leaf sums for a leaf holding a quantity >= LEAF_SUM_EXACT_BOUND:
+// `None` if sum(qty) exceeds u64, else (sum(qty), sum(slot * qty) saturated).
+// u128 cannot overflow here: sum(slot * qty) < 63 * 64 * 2^64 < 2^76.
+#[cold]
+#[inline(never)]
+fn leaf_sums_wide(values: &[u64; NUM_CHILDREN]) -> Option<(u64, u64)> {
+    let mut qty = 0u128;
+    let mut weighted = 0u128;
+    for (i, &v) in values.iter().enumerate() {
+        qty += v as u128;
+        weighted += i as u128 * v as u128;
+    }
+    let qty = u64::try_from(qty).ok()?;
+    Some((qty, u64::try_from(weighted).unwrap_or(u64::MAX)))
+}
+
+// The scalar leaf sums, auto-vectorized for AVX2 (4 x u64 lanes).
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[target_feature(enable = "avx2")]
+fn leaf_sums_avx2(values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
+    leaf_sums_scalar(values)
+}
+
+// Index of the k-th (0-based) set bit of `mask`; requires k < popcount(mask).
+#[inline(always)]
+fn select_kth_set_bit(mask: u64, k: u32) -> usize {
+    let mut m = mask;
+    for _ in 0..k {
+        m = clear_lowest_bit(m);
+    }
+    tz64(m)
+}
+
+// The same via PDEP: deposit a unit bit into the k-th set position, then
+// count trailing zeros (two instructions). Used only where PDEP is hardware
+// (`pdep_is_microcoded`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi1,bmi2")]
+#[inline]
+fn select_kth_set_bit_pdep(mask: u64, k: u32) -> usize {
+    _tzcnt_u64(_pdep_u64(1u64 << k, mask)) as usize
 }
 
 // Dense-leaf extraction: for each 8-slot chunk, the corresponding byte of
@@ -2059,18 +2052,25 @@ fn leaf_sums_avx512(values: &[u64; NUM_CHILDREN]) -> (u64, u64) {
     unsafe {
         let mut qty = _mm512_setzero_si512();
         let mut weighted = _mm512_setzero_si512();
+        let mut any = _mm512_setzero_si512();
         let mut idx = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
         let eight = _mm512_set1_epi64(8);
         for chunk in 0..NUM_CHILDREN / 8 {
             let v = _mm512_loadu_si512(values.as_ptr().add(chunk * 8) as *const _);
             qty = _mm512_add_epi64(qty, v);
             weighted = _mm512_add_epi64(weighted, _mm512_mullo_epi64(v, idx));
+            any = _mm512_or_si512(any, v);
             idx = _mm512_add_epi64(idx, eight);
         }
-        (
-            _mm512_reduce_add_epi64(qty) as u64,
-            _mm512_reduce_add_epi64(weighted) as u64,
-        )
+        // One vptestmq against the bits >= LEAF_SUM_EXACT_BOUND instead of a
+        // horizontal OR reduction.
+        let high = _mm512_set1_epi64(!(LEAF_SUM_EXACT_BOUND - 1) as i64);
+        let qty = if _mm512_test_epi64_mask(any, high) == 0 {
+            _mm512_reduce_add_epi64(qty) as u64
+        } else {
+            LEAF_SUM_INEXACT
+        };
+        (qty, _mm512_reduce_add_epi64(weighted) as u64)
     }
 }
 
@@ -2079,7 +2079,7 @@ pub struct Iter<'a> {
     glass: &'a Glass,
     leaf_idx: u32,
     mask: u64,
-    preempt_pos: usize,
+    preempt: btree_set::Range<'a, u32>,
 }
 
 impl Iterator for Iter<'_> {
@@ -2088,28 +2088,19 @@ impl Iterator for Iter<'_> {
     fn next(&mut self) -> Option<(u32, u64)> {
         while self.leaf_idx != u32::MAX {
             if self.mask != 0 {
-                let slot = self.glass.tz64(self.mask);
-                self.mask = self.glass.clear_lowest_bit(self.mask);
+                let slot = tz64(self.mask);
+                self.mask = clear_lowest_bit(self.mask);
                 let leaf = &self.glass.leaf_arena[self.leaf_idx as usize];
-                return Some((
-                    (leaf.ht_k << BITS_PER_LEVEL) | slot as u32,
-                    leaf.values[slot],
-                ));
+                return Some(leaf.level(slot));
             }
             self.leaf_idx = self.glass.leaf_arena[self.leaf_idx as usize].next_leaf;
             if self.leaf_idx != u32::MAX {
                 self.mask = self.glass.leaf_arena[self.leaf_idx as usize].mask;
             }
         }
-        // Overflow tier, in sorted order (prepared by Glass::iter).
-        let keys = unsafe { &*self.glass.sorted_preempt_keys.get() };
-        if self.preempt_pos < keys.len() {
-            let k = keys[self.preempt_pos];
-            self.preempt_pos += 1;
-            let v = unsafe { *(*self.glass.preempt.get()).get(&k).unwrap() };
-            return Some((k, v));
-        }
-        None
+        // Overflow tier, in key order.
+        let &k = self.preempt.next()?;
+        Some((k, preempt_qty(&self.glass.preempt, k)))
     }
 }
 

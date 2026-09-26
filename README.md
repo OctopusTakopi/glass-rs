@@ -4,29 +4,34 @@ Rust port of **glass** ([arXiv:2506.13991](https://arxiv.org/abs/2506.13991), Vi
 
 ## Benchmarks
 
-Intel Xeon Gold 6230 @ 2.10GHz, `cargo bench`, single run pinned to an idle core, JCC mitigation flag on (which also speeds up the BTreeMap baseline, so the ratios are honest). Bulk benches do 1M ops against a book of ~1,500 price levels with sequential/local keys.
+Intel Xeon Gold 6230 @ 2.10GHz (running at 2.8 GHz), tuned profile `latency-performance`, `nightly-2026-09-25`, JCC mitigation flag on (which also speeds up the BTreeMap baseline, so the ratios are honest). Pinned to an idle core with an idle SMT sibling; best median of two full `cargo bench` runs (they agreed within a few percent). Bulk benches do 1M ops against a book of 1,500 price levels (random keys in 500..2000, random quantities 1..1000, fixed seeds).
 
-| Operation                         | Glass (ns/op) | BTreeMap (ns/op) | Speedup   |
-|-----------------------------------|---------------|------------------|-----------|
-| Insert                            | 4.09          | 50.41            | 12.3x     |
-| Get (existing)                    | 2.40          | 43.83            | 18.3x     |
-| Get (non-existing)                | 2.36          | 43.85            | 18.6x     |
-| Remove (incl. insert)*            | 5.02          | 51.07            | 10.2x     |
-| Min                               | 2.88          | 2.48             | 0.9x      |
-| Max                               | 3.68          | 3.16             | 0.9x      |
-| **Top 25 Levels (snapshot)**      | **29.8**      | **46.5**         | **1.6x**  |
-| Compute Buy Cost (1k shares)      | 8.16          | 6.30             | 0.8x      |
-| Compute Sell Cost (1k shares)     | 10.34         | 10.55            | ~parity   |
-| **Buy Shares (1k shares)**        | **577**       | **9,382**        | **16.3x** |
-| **Sell Shares (1k shares)**       | **703**       | **9,606**        | **13.7x** |
-| Compute Buy Cost (500k, deep)     | 358           | 2,006            | 5.6x      |
-| Compute Sell Cost (500k, deep)    | 334           | 2,037            | 6.1x      |
-| **Buy Shares (500k, deep)**       | **2,519**     | **31,063**       | **12.3x** |
-| **Sell Shares (500k, deep)**      | **2,519**     | **59,868**       | **23.8x** |
+| Operation                           | Glass (ns/op) | BTreeMap (ns/op) | Speedup   |
+|-------------------------------------|---------------|------------------|-----------|
+| Insert                              | 4.32          | 65.6             | 15.2x     |
+| Get (existing)                      | 3.26          | 65.7             | 20.2x     |
+| Get (non-existing)                  | 3.26          | 65.7             | 20.2x     |
+| Remove (incl. insert)*              | 5.82          | 66.3             | 11.4x     |
+| Min                                 | 2.80          | 3.43             | 1.2x      |
+| Max                                 | 3.09          | 4.51             | 1.5x      |
+| **Top 25 Levels (snapshot)**        | **42.1**      | **62.4**         | **1.5x**  |
+| Compute Buy Cost (1k shares)        | 7.60          | 8.83             | 1.2x      |
+| Compute Sell Cost (1k shares)       | 10.8          | 13.4             | 1.2x      |
+| Buy Shares (1k shares)              | 412           | 431              | ~parity   |
+| Sell Shares (1k shares)             | 372           | 938              | 2.5x      |
+| Compute Buy Cost (500k, deep)       | 434           | 2,703            | 6.2x      |
+| Compute Sell Cost (500k, deep)      | 544           | 2,628            | 4.8x      |
+| **Buy Shares (500k, deep)**         | **2,752**     | **48,696**       | **17.7x** |
+| **Sell Shares (500k, deep)**        | **2,701**     | **80,517**       | **29.8x** |
+| Remove by Index (min, drain)        | 45.5          | 54.0             | 1.2x      |
+| **Remove by Index (max, drain)**    | **93.2**      | **1,478**        | **15.9x** |
+| **Remove by Index (random, drain)** | **95.0**      | **898**          | **9.5x**  |
 
-\* The remove bench re-inserts 1M keys per iteration; remove alone is ≈0.9 ns/op after subtracting the insert.
+\* The remove bench re-inserts 1M keys per iteration; remove alone is ≈1.5 ns/op after subtracting the insert.
 
-The *deep* rows execute/estimate a 500k-share order spanning ~24 leaves (≈1,500 levels), where whole-leaf vectorized consumption beats per-level tree walks. Absolute numbers vary with machine load; the glass/BTreeMap ratio within a run is the stable signal.
+The *deep* rows execute/estimate a 500k-share order spanning ≈1,000 levels (~16 of the book's 24 leaves), where whole-leaf vectorized consumption beats per-level tree walks. The 1k-share rows touch ~2 levels of a book whose setup just streamed 12 MB of keys and values, so they mostly measure a handful of cache misses, and glass and `BTreeMap` land close together. *Remove by Index* drains the whole book by rank (1,500 removals per iteration). Absolute numbers vary with machine load and turbo; the glass/BTreeMap ratio within a run is the stable signal.
+
+Earlier versions of this table timed dropping the whole book inside the setup-based benches (buy/sell shares, remove by index), which mostly inflated the `BTreeMap` side: its 1k-share buy went from 12.9 µs to 0.43 µs once the drop moved out of the timed region.
 
 ## Usage
 
@@ -66,7 +71,7 @@ fn main() {
 - **Bounded cache table** (paper §5.2): an intrusive hash table embedded in the leaves, hard 5-probe bound. Tri-state result (found / absent / don't-know); the rare don't-know falls back to a trie descent, so lookups are bounded *and* exact.
 - **Linked leaf list**: O(1) successor/predecessor across leaves.
 - **Whole-leaf consumption**: `buy_shares`/`compute_buy_cost` process 64 price levels at a time, one vectorized sum + one ancestor walk per leaf.
-- **Hardware acceleration**: BMI1/BMI2/LZCNT/POPCNT bit scans, AVX-512F/DQ leaf reductions. All runtime-detected with portable fallbacks; builds on any architecture (CI checks aarch64).
+- **Hardware acceleration**: AVX-512F/DQ leaf reductions, with an AVX2 build of the same reduction for CPUs without AVX-512 and a scalar fallback; PDEP k-th-bit select. All runtime-detected; builds on any architecture (aarch64 is checked). Bit scans are plain `trailing_zeros`/`leading_zeros`, which inline to `bsf`/`bsr`: a runtime-dispatched BMI intrinsic cannot inline into a baseline-x86-64 caller and costs a call per scan.
 - **Preemption** (paper §4.5): the trie holds only the best 4096 levels; worse levels overflow to a hash map and come back as the trie drains. The hot book stays compact in cache.
 
 ## API
@@ -84,14 +89,16 @@ On top of that:
 Things to know:
 
 - Quantity 0 means the level doesn't exist: `insert(key, 0)` deletes, and an `update_value` that hits 0 removes the level. This is also why there is no `get_mut`/`entry` (writing 0 through a raw `&mut u64` would corrupt the structure); use `update_value`.
-- Cost arithmetic saturates instead of overflowing.
+- Cost arithmetic saturates instead of overflowing, and the result is exact: `min(true cost, u64::MAX)`, including books whose quantities sum past `u64` within one 64-price leaf.
+- Requires a nightly toolchain (pinned in `rust-toolchain.toml`): it uses `core::hint::{likely, unlikely}` and the portable `core::hint::prefetch_*`.
+- Library code has no bare `unwrap`/`expect`. A state the internal invariants rule out (a bug, or memory corruption) panics in every build with a message naming the invariant, rather than returning plausible wrong prices.
 - Single-threaded (`Send` but not `Sync`); reads update internal caches.
 - `u32::MAX` is a valid key (the paper's "∞") but always sits in the overflow tier.
-- Only the lowest 4096 prices live in the fast trie. If you keep a deep bid book and mostly sell, store negated prices (`!price`) and use the buy-side ops.
+- Only the lowest prices live in the fast trie: up to 4096, refilled from the overflow tier once it is 32 levels short. If you keep a deep bid book and mostly sell, store negated prices (`!price`) and use the buy-side ops.
 
-Tested with a 200k-operation randomized differential test against `BTreeMap` (fixed seed) plus regression tests for past bugs. `cargo test`, and `cargo test --release` to cover the AVX-512 paths.
+Tested with a 200k-operation randomized differential test against `BTreeMap` (fixed seed), an exact `u128` oracle over huge quantities, and regression tests for past bugs. `cargo test`, and `cargo test --release` to cover the AVX-512 paths.
 
-Docs: `cargo doc --open`, example in `examples/demo.rs`.
+Docs: `cargo doc --open`, example in `examples/demo.rs`. [`demos/binance-tui`](demos/binance-tui) runs a live Binance USDT-M perpetual book in a `BTreeMap` book and a glass-rs book side by side, cross-checking them on every update.
 
 ## Tuning
 
@@ -101,7 +108,7 @@ Constants at the top of `src/lib.rs`: `MAX_SIZE` (4096, trie capacity before pre
 
 Going further:
 
-- `--features nightly`: `likely`/`unlikely` hints on hot branches (no-op on stable).
+- `-C target-cpu=native` (or `+bmi1,+bmi2,+lzcnt,+popcnt`) turns the bit scans into `tzcnt`/`lzcnt`/`blsr`/`popcnt`; measured within ~3% of the portable build.
 - PGO (`cargo-pgo`) with a recording of your feed; `-Z build-std` extends flags to std.
 - Deployment: pin the thread + `performance` governor, THP (`madvise`) for the multi-MB arenas, L3 partitioning (resctrl) to protect the hot trie from noisy neighbors.
 

@@ -2,7 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use glass_rs::Glass;
 use rand::distr::Uniform;
 use rand::prelude::*;
-use rand::rng;
+use rand::rngs::StdRng;
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::time::Duration;
@@ -11,13 +11,14 @@ const N: usize = 1000000; // Number of operations for benchmarks
 
 fn generate_random_keys(n: usize) -> Vec<u32> {
     let between = Uniform::try_from(500..2000).unwrap();
-    let mut rng = rand::rng();
+    // Fixed seeds: every run benchmarks the same book.
+    let mut rng = StdRng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
     (0..n).map(|_| between.sample(&mut rng)).collect()
 }
 
 fn generate_random_values(n: usize) -> Vec<u64> {
     let between = Uniform::try_from(1..1000).unwrap();
-    let mut rng = rand::rng();
+    let mut rng = StdRng::seed_from_u64(0xD1B5_4A32_D192_ED03);
     (0..n).map(|_| between.sample(&mut rng)).collect()
 }
 
@@ -188,6 +189,8 @@ fn bench_buy_shares(c: &mut Criterion) {
             },
             |mut glass| {
                 black_box(glass.buy_shares(black_box(target)));
+                // Return the book so criterion drops it outside the timed region.
+                glass
             },
         )
     });
@@ -203,6 +206,8 @@ fn bench_buy_shares(c: &mut Criterion) {
             },
             |mut map| {
                 black_box(buy_shares_btree(&mut map, black_box(target)));
+                // Return the book so criterion drops it outside the timed region.
+                map
             },
         )
     });
@@ -273,6 +278,8 @@ fn bench_sell(c: &mut Criterion) {
             },
             |mut glass| {
                 black_box(glass.sell_shares(black_box(target)));
+                // Return the book so criterion drops it outside the timed region.
+                glass
             },
         )
     });
@@ -288,6 +295,8 @@ fn bench_sell(c: &mut Criterion) {
             },
             |mut map| {
                 black_box(sell_shares_btree(&mut map, black_box(target)));
+                // Return the book so criterion drops it outside the timed region.
+                map
             },
         )
     });
@@ -358,6 +367,8 @@ fn bench_deep_sweep(c: &mut Criterion) {
             },
             |mut glass| {
                 black_box(glass.buy_shares(black_box(deep_target)));
+                // Return the book so criterion drops it outside the timed region.
+                glass
             },
         )
     });
@@ -373,6 +384,8 @@ fn bench_deep_sweep(c: &mut Criterion) {
             },
             |mut map| {
                 black_box(buy_shares_btree(&mut map, black_box(deep_target)));
+                // Return the book so criterion drops it outside the timed region.
+                map
             },
         )
     });
@@ -395,6 +408,8 @@ fn bench_deep_sweep(c: &mut Criterion) {
             },
             |mut glass| {
                 black_box(glass.sell_shares(black_box(deep_target)));
+                // Return the book so criterion drops it outside the timed region.
+                glass
             },
         )
     });
@@ -409,6 +424,8 @@ fn bench_deep_sweep(c: &mut Criterion) {
             },
             |mut map| {
                 black_box(sell_shares_btree(&mut map, black_box(deep_target)));
+                // Return the book so criterion drops it outside the timed region.
+                map
             },
         )
     });
@@ -439,6 +456,8 @@ fn bench_remove_by_index(c: &mut Criterion) {
                 for _ in 0..size {
                     black_box(glass.remove_by_index(black_box(0)));
                 }
+                // Return the book so criterion drops it outside the timed region.
+                glass
             },
         )
     });
@@ -462,6 +481,8 @@ fn bench_remove_by_index(c: &mut Criterion) {
                     let current_last_index = size - 1 - i;
                     black_box(glass.remove_by_index(black_box(current_last_index)));
                 }
+                // Return the book so criterion drops it outside the timed region.
+                glass
             },
         )
     });
@@ -477,7 +498,7 @@ fn bench_remove_by_index(c: &mut Criterion) {
                     glass.insert(keys[i], values[i]);
                 }
                 let size = glass.glass_size();
-                (glass, size, rng())
+                (glass, size, StdRng::seed_from_u64(7))
             },
             |(mut glass, size, mut rng)| {
                 // Routine: Drain the glass from random positions.
@@ -486,6 +507,8 @@ fn bench_remove_by_index(c: &mut Criterion) {
                     let k = rng.random_range(0..current_size);
                     black_box(glass.remove_by_index(black_box(k)));
                 }
+                // Return the book so criterion drops it outside the timed region.
+                glass
             },
         )
     });
@@ -573,6 +596,8 @@ fn bench_remove_by_index_btree(c: &mut Criterion) {
                 for _ in 0..size {
                     black_box(remove_by_index_btree(&mut map, black_box(0)));
                 }
+                // Return the book so criterion drops it outside the timed region.
+                map
             },
         )
     });
@@ -599,6 +624,8 @@ fn bench_remove_by_index_btree(c: &mut Criterion) {
                         black_box(current_last_index),
                     ));
                 }
+                // Return the book so criterion drops it outside the timed region.
+                map
             },
         )
     });
@@ -615,7 +642,7 @@ fn bench_remove_by_index_btree(c: &mut Criterion) {
                 }
                 // Get the size before moving the map.
                 let size = map.len();
-                (map, size, ThreadRng::default())
+                (map, size, StdRng::seed_from_u64(7))
             },
             |(mut map, size, mut rng)| {
                 // Routine: Drain the map from random positions.
@@ -624,6 +651,8 @@ fn bench_remove_by_index_btree(c: &mut Criterion) {
                     let k = rng.random_range(0..current_size);
                     black_box(remove_by_index_btree(&mut map, black_box(k)));
                 }
+                // Return the book so criterion drops it outside the timed region.
+                map
             },
         )
     });
