@@ -1,0 +1,54 @@
+# Long-running live verification: glass-rs vs BTreeMap on one Binance
+# USDT-M perpetual per instance, e.g. glass-binance@BTCUSDT and, for tiny
+# prices with huge sizes, glass-binance@1000SATSUSDT.
+#
+#   install -D -m 755 target/release/binance-tui /opt/glass-binance/binance-tui
+#   install -m 644 deploy/glass-binance@.service /etc/systemd/system/
+#   mkdir -p /etc/glass-binance
+#   echo "UNTIL=$(date -d '+7 days' +%s)" > /etc/glass-binance/BTCUSDT.env
+#   systemctl daemon-reload && systemctl enable --now glass-binance@BTCUSDT
+#
+#   journalctl -u glass-binance@BTCUSDT -f            # reports, reconnects, any mismatch
+#   cat /var/lib/glass-binance-BTCUSDT/report.txt     # latest report
+#
+# Exit status 3 = the books disagreed (evidence in
+# /var/lib/glass-binance-SYMBOL/mismatch-N.txt); that verdict is never
+# restarted away. Anything else abnormal (a panic, a crash) restarts; the
+# deadline stays. Past the deadline the service exits cleanly at once.
+
+[Unit]
+Description=glass-rs live verification against BTreeMap (Binance %i)
+Wants=network-online.target
+After=network-online.target
+# Start-up failures (e.g. no network at boot) keep retrying.
+StartLimitIntervalSec=0
+
+[Service]
+# UNTIL=<unix seconds>: the run's wall-clock deadline.
+EnvironmentFile=/etc/glass-binance/%i.env
+ExecStart=/opt/glass-binance/binance-tui %i --until ${UNTIL} --report-every 60 --state-dir /var/lib/glass-binance-%i
+Environment=RUST_BACKTRACE=1
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=3
+
+# A guest on a shared machine: its own throwaway user, one core at most,
+# low priority, bounded memory, read-only everywhere but its state directory.
+DynamicUser=yes
+StateDirectory=glass-binance-%i
+Nice=10
+CPUQuota=100%
+MemoryMax=512M
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

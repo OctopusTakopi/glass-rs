@@ -54,11 +54,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let secs = app.started.elapsed().as_secs_f64().max(1e-9);
     let [q50, q99, _] = app.queue.percentiles();
-    let check = if app.check_failures == 0 {
+    let check = if app.check_failures == 0 && app.exec_failures == 0 && app.audit_failures == 0 {
         Span::styled(
             format!(
-                "books agree: {} checks ({} full), 0 mismatches",
-                app.checks, app.full_checks
+                "books agree: {} checks ({} full), {} execution checks ({} ops), {} exchange audits, 0 mismatches",
+                app.checks, app.full_checks, app.exec_checks, app.exec_ops, app.audits
             ),
             Style::new().fg(Color::Green),
         )
@@ -66,7 +66,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!(
                 "MISMATCH x{}: {}",
-                app.check_failures,
+                app.check_failures + app.exec_failures + app.audit_failures,
                 app.first_failure.as_deref().unwrap_or("")
             ),
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -97,10 +97,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             format!("  {spread}").into(),
         ]),
         Line::from(format!(
-            " {} events ({:.1}/s), {} level updates, {} resyncs, crossed {}, feed->book queue p50 {} p99 {}",
+            " {} events ({:.1}/s), {} level updates, {} reconnects, {} resyncs, crossed {}, feed->book queue p50 {} p99 {}",
             app.events,
             app.events as f64 / secs,
             app.level_updates,
+            app.reconnects,
             app.resyncs,
             app.crossed,
             ns(q50),

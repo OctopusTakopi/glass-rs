@@ -12,8 +12,8 @@ cd demos/binance-tui
 cargo run --release -- BTCUSDT            # q quits, +/- change the market-order size
 cargo run --release -- ETHUSDT --spin     # busy-poll: lower, steadier latency
 
-# no terminal: run 60 s, print a report (+ one rendered frame), exit non-zero
-# if the books ever disagreed or the book crossed
+# no terminal: run 60 s, print a report (+ one rendered frame), exit 3 if
+# the books ever disagreed
 cargo run --release -- BTCUSDT --headless 60 --frame
 ```
 
@@ -25,6 +25,66 @@ sizes are parsed from Binance's decimal strings to integer ticks/lots
 exactly (no floats). Asks are keyed by tick price and bids by the
 bit-inverted tick price, so each side's best levels live in glass's fast
 trie.
+
+Besides the per-update cross-check, every 10 s an *execution check* copies
+each side of the live book into a fresh glass and a `BTreeMap` oracle and
+runs 200 random operations on both, comparing every result: market buys and
+sells (`buy_shares`/`sell_shares`), `remove_by_index`, `pop_first`/`pop_last`,
+`update_value`, `next_level`/`prev_level`, `range`, cost estimates, inserts and
+removes. The live feed only drives inserts, removes and lookups; this puts
+real market-shaped data through the rest of the API.
+
+Agreement between the two books says nothing about the L2 book itself: if
+the sync logic were wrong, both would be wrong together. So every 5 minutes
+an *exchange audit* fetches a fresh REST snapshot and compares both books
+with it once the stream reaches the snapshot's `lastUpdateId`: exactly, if
+an event ends there; otherwise with the levels of the event that straddles
+it exempt (they may hold any value from inside that event). Only prices both
+the audit snapshot and the books' own sync snapshot reach are judged: a
+snapshot holds the best 1000 levels by count, so as the book moves it reaches
+resting orders the local book never saw. For the same reason the app
+re-syncs once fewer than 100 levels on a side remain inside the reach of the
+snapshot it synced from, before the top of the book can leave the region it
+knows. The sync procedure, both books' L2 semantics and the audit have unit
+tests with hand-computed books (`cargo test`).
+
+## Running unattended
+
+No network failure stops it. Every connect, TLS/WebSocket handshake and REST
+call has a deadline, and a connection that delivers no depth data for 60 s
+counts as dead (Binance only pings every 3 minutes, and a half-open TCP
+connection otherwise blocks forever). A dropped stream reconnects (Binance
+also closes every connection after 24 h), and a gap or a snapshot that lags the
+stream resyncs. Each waits out an exponential back-off (1 s doubling to
+5 min, or the server's `Retry-After` on HTTP 429/418), and the streak resets
+after 600 live updates. The tick/lot grid is re-read on every reconnect,
+since Binance does change it.
+
+A disagreement between the books is logged, its evidence (the last 256
+updates and both books in full) written to `--state-dir`, and the books
+rebuilt from a fresh snapshot, so later checks still mean something. A
+crossed book is reported but is not a failure: it is feed data that both
+books agree on.
+
+`deploy/glass-binance@.service` runs it headless under systemd, one
+instance per symbol (`glass-binance@BTCUSDT`, `glass-binance@1000SATSUSDT`),
+each until its own deadline:
+
+```sh
+binance-tui BTCUSDT --until $(date -d '+7 days' +%s) --report-every 60 \
+    --state-dir /var/lib/glass-binance-BTCUSDT
+```
+
+Low-priced coins with huge sizes are worth running alongside BTC. 1000SATS
+trades at ~0.00001 USDT in whole-coin lots, ~1e11 lots per side, so its
+integer sums leave the range BTC's books ever reach: `u32::MAX × lots` and
+glass's bid-side sums (keys `!ticks` ~ 4.3e9) pass `u64`, exercising the
+saturating arithmetic. The full check compares glass's `compute_buy_cost` /
+`compute_sell_cost` in its own key space against an exact `u128` oracle at
+order sizes up to 1e12 lots (4e9 lots lands just under `u64::MAX`).
+
+Test hooks: `BINANCE_TUI_REST` / `BINANCE_TUI_WS` override the endpoints, and
+`BINANCE_TUI_CHAOS_SECS=N` drops each stream connection after N seconds.
 
 ## Measuring it
 

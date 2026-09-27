@@ -90,4 +90,23 @@ mod tests {
         assert_eq!(tick.to_units("-1"), None);
         assert_eq!(tick.to_units("1e3"), None);
     }
+
+    /// 1000SATSUSDT: an 8-decimal tick and whole-coin lots in the tens of
+    /// billions.
+    #[test]
+    fn tiny_prices_and_huge_sizes() {
+        let tick = Unit::parse("0.00000001").unwrap();
+        assert_eq!(tick.to_units("0.00001264"), Some(1264));
+        assert_eq!(tick.to_units("0.0000126"), Some(1260));
+        assert_eq!(tick.to_units("0.000012645"), None); // off the tick grid
+        assert_eq!(tick.to_units("0.00001264000"), Some(1264));
+        assert_eq!(tick.format(1264), "0.00001264");
+        assert_eq!(tick.format(90_000_000), "0.90000000");
+        let lot = Unit::parse("1").unwrap();
+        assert_eq!(lot.to_units("50210000000"), Some(50_210_000_000));
+        assert_eq!(lot.to_units("50210000000.5"), None);
+        assert_eq!(lot.to_units("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(lot.to_units("18446744073709551616"), None); // past u64: rejected, no wrap
+        assert_eq!(tick.to_units("184467440737.09551616"), None);
+    }
 }
