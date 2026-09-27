@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Fix: stale path cache after a leaf empties.** `remove` (and `pop_first`,
+  `pop_last`, `remove_by_index`, a zeroing `update_value`) frees a leaf's
+  now-empty ancestors when it removes the leaf's last level, but dropped the
+  cached traversal path only if the cached key was the key removed. The cache
+  could name another level of the same leaf that `buy_shares`/`sell_shares`
+  had already consumed; the next insert sharing that path's top levels then
+  hung its leaf under a freed node, leaving it unreachable: wrong
+  `min`/`max`/`pop_*`/cost results, or an out-of-bounds panic. Needs a leaf
+  alone in its subtree, i.e. a sparse book or a sparse tail. Found within 15
+  minutes by the live Binance demo's execution check on a BTCUSDT book copy;
+  fuzzing that operation mix failed ~7% of seeds, 0 of 4000 after the fix.
+  Regression tests: the 8-operation repro, and a randomized consuming-ops
+  test on market-shaped and scattered books.
+- **`check-invariants` feature**: `Glass::check_invariants()` verifies the
+  whole internal structure (trie counts and masks, no leaked or doubly
+  reachable nodes, hash chains, leaf list, min/max caches, tier split, and
+  the cached traversal path), so tests and fuzzing catch a corruption when it
+  happens rather than when something later trips over it. Not part of the
+  default API.
+- **Fuzzing** (`fuzz/`, cargo-fuzz): every public operation against a
+  `BTreeMap` oracle with exact costs, keys shaped to hit dense, scattered,
+  hash-colliding and edge regions, order sizes pinned to level boundaries,
+  and `check_invariants` after every step.
 - **Fix: leaf-sum overflow.** `leaf_sums` wrapped mod 2^64, so a leaf (64
   adjacent prices) whose quantities summed past `u64` sent `buy_shares`,
   `sell_shares`, `compute_buy_cost` and `compute_sell_cost` down the

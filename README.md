@@ -92,11 +92,11 @@ Things to know:
 - Cost arithmetic saturates instead of overflowing, and the result is exact: `min(true cost, u64::MAX)`, including books whose quantities sum past `u64` within one 64-price leaf.
 - Requires a nightly toolchain (pinned in `rust-toolchain.toml`): it uses `core::hint::{likely, unlikely}` and the portable `core::hint::prefetch_*`.
 - Library code has no bare `unwrap`/`expect`. A state the internal invariants rule out (a bug, or memory corruption) panics in every build with a message naming the invariant, rather than returning plausible wrong prices.
-- Single-threaded (`Send` but not `Sync`); reads update internal caches.
+- `Send` but not `Sync` (its caches are `Cell`s): move it between threads, don't share it.
 - `u32::MAX` is a valid key (the paper's "∞") but always sits in the overflow tier.
 - Only the lowest prices live in the fast trie: up to 4096, refilled from the overflow tier once it is 32 levels short. If you keep a deep bid book and mostly sell, store negated prices (`!price`) and use the buy-side ops.
 
-Tested with a 200k-operation randomized differential test against `BTreeMap` (fixed seed), an exact `u128` oracle over huge quantities, and regression tests for past bugs. `cargo test`, and `cargo test --release` to cover the AVX-512 paths.
+Tested with a 200k-operation randomized differential test against `BTreeMap` (fixed seed), randomized market-order sequences on market-shaped and scattered books, an exact `u128` oracle over huge quantities, and regression tests for past bugs. `cargo test`, and `cargo test --release` to cover the AVX-512 paths; `cargo test --features check-invariants` adds a full structural self-check (`Glass::check_invariants`) through the randomized tests. `fuzz/` holds a coverage-guided fuzz target (cargo-fuzz) that checks every operation against a `BTreeMap` oracle and every internal invariant after each step.
 
 Docs: `cargo doc --open`, example in `examples/demo.rs`. [`demos/binance-tui`](demos/binance-tui) runs a live Binance USDT-M perpetual book in a `BTreeMap` book and a glass-rs book side by side, cross-checking them on every update.
 

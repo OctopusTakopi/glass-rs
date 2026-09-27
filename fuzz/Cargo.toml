@@ -1,0 +1,34 @@
+[package]
+name = "glass-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+glass-rs = { path = "..", features = ["check-invariants"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ops"
+path = "fuzz_targets/ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "walk"
+path = "src/bin/walk.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone: not part of the library's build.
+[workspace]
+members = ["."]

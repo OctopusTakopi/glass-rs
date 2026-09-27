@@ -728,3 +728,178 @@ fn huge_quantities_match_exact_oracle() {
         );
     }
 }
+
+/// Emptying a leaf frees its now-empty ancestors, so the cached traversal
+/// path must be dropped when it ran through them: that is, when the cached
+/// key lived in the emptied leaf, even if it is not the key being removed.
+/// Here `buy_shares` consumes 2520204642 (which cached its path) and
+/// `pop_last` then empties the leaf through its sibling 2520204643; the old
+/// check (`cached key == removed key`) kept the stale path, the next insert
+/// sharing its top level hung its leaf under a freed node, and `buy_shares`
+/// panicked on the unlinked leaf. Found by the live Binance run's execution
+/// check, on a copy of the BTCUSDT book.
+#[test]
+fn path_cache_cleared_when_leaf_emptied() {
+    let mut g = Glass::new();
+    g.insert(2150907650, 2);
+    g.insert(2520204643, 5);
+    assert_eq!(g.pop_first(), Some((2150907650, 2)));
+    g.insert(2520204642, 7);
+    assert_eq!(g.buy_shares(8), 2520204642 * 7 + 2520204643);
+    assert_eq!(g.pop_last(), Some((2520204643, 4)));
+    assert!(g.is_empty());
+    g.insert(2860251627, 1);
+    assert_eq!(g.min(), Some((2860251627, 1)));
+    assert_eq!(g.buy_shares(1), 2860251627);
+    assert!(g.is_empty());
+}
+
+/// The consuming operations interleaved with inserts, removes and updates,
+/// every result checked against the oracle (the whole book every 250
+/// operations), on two kinds of book:
+///
+/// * market-shaped: dense near the top, sparse in the tail, some past the
+///   4096-level trie capacity;
+/// * scattered: a few hundred keys across the whole `u32` range, so every
+///   leaf is alone in its subtree and emptying it frees ancestors, the case
+///   the dense `random_ops_match_btreemap` universe rarely reaches.
+///
+/// Deterministic: with the stale-path-cache bug of
+/// `path_cache_cleared_when_leaf_emptied`, scattered seeds 5, 28, 31, 33 and
+/// 39 panic.
+#[test]
+fn consuming_ops_on_sparse_books() {
+    for seed in 1..=4u64 {
+        consuming_ops(seed, false);
+    }
+    for seed in 1..=40u64 {
+        consuming_ops(seed, true);
+    }
+}
+
+fn consuming_ops(seed: u64, scattered: bool) {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut oracle = BTreeMap::new();
+    if scattered {
+        let n = 20 + rng.below(200) as usize;
+        while oracle.len() < n {
+            oracle.insert(rng.next() as u32, 1 + rng.below(50_000));
+        }
+    } else {
+        let n = 2500 + rng.below(3000) as usize;
+        let base = (rng.next() as u32) | 0x8000_0000;
+        let mut off = 0u32;
+        while oracle.len() < n {
+            let gap = if oracle.len() < 800 {
+                1 + rng.below(3)
+            } else {
+                1 + rng.below(200)
+            };
+            off = off.wrapping_add(gap as u32);
+            oracle.insert(base.wrapping_add(off), 1 + rng.below(50_000));
+        }
+    }
+    let mut glass: Glass = oracle.iter().map(|(&k, &v)| (k, v)).collect();
+    let universe: Vec<u32> = oracle.keys().step_by(7).copied().collect();
+
+    for step in 0..1500u64 {
+        let ctx = format!("seed {seed} (scattered: {scattered}) step {step}");
+        let r = rng.next();
+        let total: u64 = oracle.values().sum();
+        let unit = (total / oracle.len().max(1) as u64).max(1);
+        // Order sizes: mostly a few levels, some deep, rarely a full sweep.
+        let size = match r % 64 {
+            0 => u64::MAX,
+            1..=40 => 1 + rng.below(3 * unit),
+            _ => 1 + rng.below(total / 8 + 1),
+        };
+        // An existing key or a neighbour of one, or anywhere at all.
+        let key = match (oracle.len() as u64, rng.below(4)) {
+            (0, _) | (_, 3) => rng.next() as u32,
+            (len, d) => {
+                let k = *oracle.keys().nth(rng.below(len) as usize).unwrap();
+                k.wrapping_add(d as u32).wrapping_sub(1)
+            }
+        };
+        match (r >> 40) % 9 {
+            0 => assert_eq!(
+                glass.buy_shares(size),
+                oracle_buy_shares(&mut oracle, size),
+                "buy_shares({size}) {ctx}"
+            ),
+            1 => assert_eq!(
+                glass.sell_shares(size),
+                oracle_sell_shares(&mut oracle, size),
+                "sell_shares({size}) {ctx}"
+            ),
+            2 => {
+                assert_eq!(
+                    glass.compute_buy_cost(size),
+                    oracle_buy_cost(&oracle, size),
+                    "compute_buy_cost({size}) {ctx}"
+                );
+                assert_eq!(
+                    glass.compute_sell_cost(size),
+                    oracle_sell_cost(&oracle, size),
+                    "compute_sell_cost({size}) {ctx}"
+                );
+            }
+            3 => {
+                let k = rng.below(oracle.len() as u64 + 1) as usize;
+                let want = oracle
+                    .keys()
+                    .nth(k)
+                    .copied()
+                    .map(|key| (key, oracle.remove(&key).unwrap()));
+                assert_eq!(glass.remove_by_index(k), want, "remove_by_index({k}) {ctx}");
+            }
+            4 => assert_eq!(glass.pop_first(), oracle.pop_first(), "pop_first {ctx}"),
+            5 => assert_eq!(glass.pop_last(), oracle.pop_last(), "pop_last {ctx}"),
+            6 => {
+                let delta = rng.below(2 * unit + 1) as i64 - unit as i64;
+                let f = |q: &mut u64| *q = q.saturating_add_signed(delta);
+                let want = match oracle.get_mut(&key) {
+                    Some(q) => {
+                        f(q);
+                        if *q == 0 {
+                            oracle.remove(&key);
+                        }
+                        true
+                    }
+                    None => false,
+                };
+                assert_eq!(
+                    glass.update_value(key, f),
+                    want,
+                    "update_value({key}, {delta:+}) {ctx}"
+                );
+            }
+            7 => {
+                let q = rng.below(4 * unit);
+                glass.insert(key, q);
+                if q == 0 {
+                    oracle.remove(&key);
+                } else {
+                    oracle.insert(key, q);
+                }
+            }
+            _ => assert_eq!(
+                glass.remove(key),
+                oracle.remove(&key),
+                "remove({key}) {ctx}"
+            ),
+        }
+        assert_eq!(glass.len(), oracle.len(), "len {ctx}");
+        #[cfg(feature = "check-invariants")]
+        if step % 16 == 0
+            && let Err(e) = glass.check_invariants()
+        {
+            panic!("invariant broken, {ctx}: {e}");
+        }
+        if step % 250 == 249 {
+            check_all(&glass, &oracle, &universe, &ctx);
+        }
+    }
+    let ctx = format!("seed {seed} (scattered: {scattered}) end");
+    check_all(&glass, &oracle, &universe, &ctx);
+}

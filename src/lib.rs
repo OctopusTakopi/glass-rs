@@ -31,9 +31,8 @@
 //!   level, and an [`Glass::update_value`] that reaches 0 removes the level.
 //! - Cost arithmetic ([`Glass::buy_shares`], [`Glass::compute_buy_cost`] and
 //!   the sell-side mirrors) is exact and saturates at `u64::MAX`.
-//! - `Glass` is single-threaded by design: it is `Send` but not `Sync`,
-//!   because read operations update internal caches through interior
-//!   mutability.
+//! - `Glass` is `Send` but not `Sync`: its internal caches are `Cell`s, so
+//!   it can move between threads but not be shared by them.
 //! - SIMD kernels (AVX-512F+DQ, AVX2) and PDEP select are detected at
 //!   runtime, with portable fallbacks; the crate builds on any architecture.
 //!   Requires a nightly toolchain.
@@ -1717,7 +1716,8 @@ impl Glass {
             self.arena[*parent_idx as usize].count -= 1;
         }
 
-        if leaf.mask == 0 {
+        let leaf_freed = leaf.mask == 0;
+        if leaf_freed {
             let p_l = leaf.prev_leaf;
             let n_l = leaf.next_leaf;
             if p_l != u32::MAX {
@@ -1736,7 +1736,15 @@ impl Glass {
             self.prune_empty_path(&path);
         }
 
-        if self.cached_last_key.get() == Some(key) {
+        // Freeing the leaf may have freed its ancestors, and with them the
+        // cached path of any key in this leaf, not just `key`: buy/sell
+        // consume levels without touching the cache, so it can still name an
+        // already consumed level here. A stale path would hang the next
+        // insert under a freed node (the rule `detach_leaf_from_trie` follows;
+        // `tests/differential.rs::path_cache_cleared_when_leaf_emptied`).
+        if let Some(lk) = self.cached_last_key.get()
+            && (lk == key || (leaf_freed && lk >> BITS_PER_LEVEL == partial))
+        {
             self.cached_last_key.set(None);
             self.cached_d.set(0);
         }
@@ -2182,6 +2190,308 @@ impl Extend<(u32, u64)> for Glass {
         for (k, v) in iter {
             self.insert(k, v);
         }
+    }
+}
+
+#[cfg(any(test, feature = "check-invariants"))]
+impl Glass {
+    /// Verifies every internal invariant, for fuzzing and tests: the trie's
+    /// masks and counts, that every allocated node and leaf is either live
+    /// or free (no leaks, nothing freed still reachable), the hash-table
+    /// chains, the ordered leaf list, the min/max caches, the tier split and
+    /// its threshold, and that the cached traversal path runs through live
+    /// nodes on its key's path. O(size of the structure).
+    pub fn check_invariants(&self) -> Result<(), String> {
+        use std::collections::BTreeMap as Map;
+        macro_rules! ensure {
+            ($cond:expr, $($msg:tt)+) => {
+                if !$cond {
+                    return Err(format!($($msg)+));
+                }
+            };
+        }
+        let none = u32::MAX;
+
+        // Trie: walk from the root, recording each live node's level and
+        // each live leaf's partial key.
+        let mut node_level: Map<u32, usize> = Map::new();
+        let mut leaves: Map<u32, u32> = Map::new(); // partial key -> leaf
+        let mut trie_keys = 0usize;
+        fn walk(
+            g: &Glass,
+            node: u32,
+            level: usize,
+            prefix: u32,
+            node_level: &mut Map<u32, usize>,
+            leaves: &mut Map<u32, u32>,
+            keys: &mut usize,
+        ) -> Result<u32, String> {
+            if (node as usize) >= g.arena.len() {
+                return Err(format!("node {node} at level {level} out of the arena"));
+            }
+            if node_level.insert(node, level).is_some() {
+                return Err(format!("node {node} reachable twice"));
+            }
+            let n = &g.arena[node as usize];
+            let mut count = 0u32;
+            for slot in 0..NUM_CHILDREN {
+                let child = n.children[slot];
+                let bit = n.mask >> slot & 1 == 1;
+                if bit != (child != u32::MAX) {
+                    return Err(format!(
+                        "node {node} slot {slot}: mask bit {bit}, child {child}"
+                    ));
+                }
+                if child == u32::MAX {
+                    continue;
+                }
+                let prefix = prefix << BITS_PER_LEVEL | slot as u32;
+                count += if level == NUM_LEVELS - 2 {
+                    if (child as usize) >= g.leaf_arena.len() {
+                        return Err(format!("leaf {child} out of the leaf arena"));
+                    }
+                    let leaf = &g.leaf_arena[child as usize];
+                    if leaves.insert(prefix, child).is_some() {
+                        return Err(format!("leaf {child} reachable twice"));
+                    }
+                    if leaf.ht_k != prefix {
+                        return Err(format!(
+                            "leaf {child} at partial key {prefix} has ht_k {}",
+                            leaf.ht_k
+                        ));
+                    }
+                    if leaf.mask == 0 {
+                        return Err(format!("empty leaf {child} still in the trie"));
+                    }
+                    for (i, &v) in leaf.values.iter().enumerate() {
+                        if (leaf.mask >> i & 1 == 1) != (v != 0) {
+                            return Err(format!(
+                                "leaf {child} slot {i}: mask/value disagree (value {v})"
+                            ));
+                        }
+                    }
+                    *keys += leaf.mask.count_ones() as usize;
+                    leaf.mask.count_ones()
+                } else {
+                    walk(g, child, level + 1, prefix, node_level, leaves, keys)?
+                };
+            }
+            if n.count != count {
+                return Err(format!(
+                    "node {node} at level {level}: count {} but {count} levels below",
+                    n.count
+                ));
+            }
+            if level > 0 && n.mask == 0 {
+                return Err(format!("empty node {node} at level {level} not pruned"));
+            }
+            Ok(count)
+        }
+        walk(
+            self,
+            ROOT,
+            0,
+            0,
+            &mut node_level,
+            &mut leaves,
+            &mut trie_keys,
+        )?;
+        ensure!(
+            trie_keys == self.glass_size(),
+            "root count {} but {trie_keys} trie levels",
+            self.glass_size()
+        );
+        ensure!(
+            trie_keys <= MAX_SIZE,
+            "trie holds {trie_keys} > {MAX_SIZE} levels"
+        );
+
+        // Allocation: everything is live or free, exactly once.
+        let free: std::collections::BTreeSet<u32> = self.free_list.iter().copied().collect();
+        ensure!(
+            free.len() == self.free_list.len(),
+            "node free list has duplicates"
+        );
+        ensure!(!free.contains(&ROOT), "the root is on the free list");
+        for f in &free {
+            ensure!(!node_level.contains_key(f), "free node {f} is reachable");
+        }
+        ensure!(
+            node_level.len() + free.len() == self.arena.len(),
+            "{} live + {} free nodes != arena {} (leaked nodes)",
+            node_level.len(),
+            free.len(),
+            self.arena.len()
+        );
+        let live_leaves: std::collections::BTreeSet<u32> = leaves.values().copied().collect();
+        ensure!(
+            live_leaves.len() == leaves.len(),
+            "a leaf is reachable at two partial keys"
+        );
+        let free_leaves: std::collections::BTreeSet<u32> =
+            self.leaf_free_list.iter().copied().collect();
+        ensure!(
+            free_leaves.len() == self.leaf_free_list.len(),
+            "leaf free list has duplicates"
+        );
+        for f in &free_leaves {
+            ensure!(!live_leaves.contains(f), "free leaf {f} is reachable");
+        }
+        ensure!(
+            live_leaves.len() + free_leaves.len() == self.leaf_arena.len(),
+            "{} live + {} free leaves != leaf arena {} (leaked leaves)",
+            live_leaves.len(),
+            free_leaves.len(),
+            self.leaf_arena.len()
+        );
+
+        // Hash table: each live leaf exactly once, in its own bucket, with
+        // consistent back links; nothing else chained.
+        let mut chained = 0usize;
+        for (h, &head) in self.ht_heads.iter().enumerate() {
+            let (mut prev, mut cur) = (none, head);
+            while cur != none {
+                ensure!(
+                    (cur as usize) < self.leaf_arena.len(),
+                    "bucket {h} chains leaf {cur} out of the arena"
+                );
+                let leaf = &self.leaf_arena[cur as usize];
+                ensure!(
+                    leaves.get(&leaf.ht_k) == Some(&cur),
+                    "bucket {h} chains leaf {cur} (ht_k {}) that is not live",
+                    leaf.ht_k
+                );
+                ensure!(
+                    leaf.ht_k as usize & (HT_SIZE - 1) == h,
+                    "leaf {cur} (ht_k {}) chained in bucket {h}",
+                    leaf.ht_k
+                );
+                ensure!(
+                    leaf.ht_prev == prev,
+                    "leaf {cur}: ht_prev {} but reached from {prev}",
+                    leaf.ht_prev
+                );
+                chained += 1;
+                ensure!(chained <= leaves.len(), "bucket {h}: chain cycles");
+                (prev, cur) = (cur, leaf.ht_next);
+            }
+        }
+        ensure!(
+            chained == leaves.len(),
+            "{chained} leaves chained, {} live",
+            leaves.len()
+        );
+
+        // Leaf list: all live leaves in ascending key order, linked both ways.
+        let (mut prev, mut cur) = (none, self.min_leaf.get());
+        let mut order = leaves.values();
+        while cur != none {
+            ensure!(
+                order.next() == Some(&cur),
+                "leaf list out of order at leaf {cur}"
+            );
+            let leaf = &self.leaf_arena[cur as usize];
+            ensure!(
+                leaf.prev_leaf == prev,
+                "leaf {cur}: prev_leaf {} but reached from {prev}",
+                leaf.prev_leaf
+            );
+            (prev, cur) = (cur, leaf.next_leaf);
+        }
+        ensure!(order.next().is_none(), "leaf list ends early");
+        ensure!(
+            self.max_leaf.get() == prev,
+            "max_leaf {} but the list ends at {prev}",
+            self.max_leaf.get()
+        );
+
+        // Min/max caches.
+        let key_of = |leaf: u32, low: bool| {
+            let l = &self.leaf_arena[leaf as usize];
+            let slot = if low {
+                l.mask.trailing_zeros()
+            } else {
+                63 - l.mask.leading_zeros()
+            };
+            l.ht_k << BITS_PER_LEVEL | slot
+        };
+        match (leaves.values().next(), leaves.values().next_back()) {
+            (Some(&lo), Some(&hi)) => {
+                ensure!(
+                    self.min_key.get() == key_of(lo, true),
+                    "min_key {} != {}",
+                    self.min_key.get(),
+                    key_of(lo, true)
+                );
+                ensure!(
+                    self.max_key.get() == key_of(hi, false),
+                    "max_key {} != {}",
+                    self.max_key.get(),
+                    key_of(hi, false)
+                );
+            }
+            _ => {
+                ensure!(
+                    self.min_leaf.get() == none && self.max_leaf.get() == none,
+                    "empty trie with min/max leaves set"
+                );
+            }
+        }
+
+        // Tiers: the key index mirrors the map, the threshold is its minimum,
+        // and every trie key is below it.
+        ensure!(
+            self.preempt.len() == self.preempt_keys.len(),
+            "preempt map {} keys, index {}",
+            self.preempt.len(),
+            self.preempt_keys.len()
+        );
+        for k in &self.preempt_keys {
+            ensure!(
+                matches!(self.preempt.get(k), Some(&q) if q != 0),
+                "preempt key {k} missing or zero"
+            );
+        }
+        let thres = self.preempt_keys.first().copied().unwrap_or(u32::MAX);
+        ensure!(
+            self.thres == thres,
+            "thres {} but lowest preempt key {thres}",
+            self.thres
+        );
+        if let Some(&hi) = leaves.values().next_back() {
+            ensure!(
+                key_of(hi, false) < self.thres,
+                "trie key {} not below thres {}",
+                key_of(hi, false),
+                self.thres
+            );
+        }
+
+        // Cached path: when set, it must be the live path to its key.
+        if let Some(k) = self.cached_last_key.get()
+            && self.cached_d.get() > 0
+        {
+            let mut node = ROOT;
+            for l in 0..NUM_LEVELS - 1 {
+                ensure!(
+                    self.cached_path[l].get() == node,
+                    "cached path for {k}: level {l} is node {} but the live path has {node}",
+                    self.cached_path[l].get()
+                );
+                let slot = ((k >> ((NUM_LEVELS - 1 - l) * BITS_PER_LEVEL)) & 0x3F) as usize;
+                node = self.arena[node as usize].children[slot];
+                ensure!(
+                    node != none,
+                    "cached path for {k} leads out of the trie at level {l}"
+                );
+            }
+            ensure!(
+                self.cached_leaf.get() == node,
+                "cached leaf for {k} is {} but the live leaf is {node}",
+                self.cached_leaf.get()
+            );
+        }
+        Ok(())
     }
 }
 

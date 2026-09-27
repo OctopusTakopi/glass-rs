@@ -15,6 +15,9 @@ exclude = [".idea/", ".github/"]
 # Deprecated no-op, kept so existing `--features nightly` builds still work:
 # the crate now always builds on nightly and always uses the hints.
 nightly = []
+# `Glass::check_invariants`, a full structural self-check for fuzzing and
+# tests (`cargo test --features check-invariants`, the fuzz target).
+check-invariants = []
 
 [dependencies]
 ahash = "0.8"
