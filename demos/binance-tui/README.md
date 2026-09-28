@@ -42,10 +42,17 @@ an event ends there; otherwise with the levels of the event that straddles
 it exempt (they may hold any value from inside that event). Only prices both
 the audit snapshot and the books' own sync snapshot reach are judged: a
 snapshot holds the best 1000 levels by count, so as the book moves it reaches
-resting orders the local book never saw. For the same reason the app
-re-syncs once fewer than 100 levels on a side remain inside the reach of the
-snapshot it synced from, before the top of the book can leave the region it
-knows. The sync procedure, both books' L2 semantics and the audit have unit
+resting orders the local book never saw.
+
+Binance's procedure takes one snapshot, plus a new one after a gap. That
+leaves the book incomplete beyond the snapshot's reach: an order resting
+there since before the sync, unchanged since, is never sent by the stream,
+and stays unknown when the price moves to it (Binance's spot docs note the
+same). BTC's 1000 levels span only ~$100-300 a side, so over a day the
+price leaves that range many times. The app therefore also re-syncs, checked
+on every update, once fewer than 300 levels on a side remain inside the
+reach of the snapshot it synced from, so the top of the book never leaves the
+region it knows (one REST call, weight 20, each time; BTC needed ~100 a day). The sync procedure, both books' L2 semantics and the audit have unit
 tests with hand-computed books (`cargo test`).
 
 ## Running unattended

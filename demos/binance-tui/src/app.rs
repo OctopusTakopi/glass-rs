@@ -46,6 +46,11 @@ const FIRST_AUDIT: Duration = Duration::from_secs(60);
 /// Retry delay when an audit could not be placed (the snapshot was older
 /// than the book, a fetch failed, or a resync intervened).
 const AUDIT_RETRY: Duration = Duration::from_secs(30);
+/// Re-sync once fewer than this many levels on a side remain inside the
+/// reach of the snapshot the books were synced from (see `left_reach`).
+/// BTC's 1000-level reach spans only ~$100-300 a side, so the margin keeps
+/// the new snapshot ahead of a fast move.
+const MIN_KNOWN: usize = 300;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -608,9 +613,11 @@ impl App {
             self.fail(format!("MISMATCH after update {id}: {e}"));
             return false;
         }
-        if full && let Some(why) = self.left_reach() {
+        if let Some(why) = self.left_reach() {
             // Not a failure: the book is only complete near the price it was
-            // synced at, so a long run re-syncs as the market moves.
+            // synced at, so a long run re-syncs as the market moves. Checked
+            // on every update: BTC can cross its whole ~1000-level reach
+            // within the 16 updates between full checks.
             self.drop_audit();
             self.resyncs += 1;
             self.phase = Phase::Resync { at: Instant::now() };
@@ -637,9 +644,8 @@ impl App {
     /// sync snapshot vouched for, where the top of the book could be missing
     /// resting orders the stream never mentioned.
     fn left_reach(&self) -> Option<String> {
-        const MIN_KNOWN: usize = 100;
         if let Some(floor) = self.synced.bid_floor {
-            let known = self.btree.count_from(Side::Bid, floor);
+            let known = self.btree.count_from(Side::Bid, floor, MIN_KNOWN);
             if known < MIN_KNOWN {
                 return Some(format!(
                     "only {known} bids left above the synced floor {floor}"
@@ -647,7 +653,7 @@ impl App {
             }
         }
         if let Some(ceiling) = self.synced.ask_ceiling {
-            let known = self.btree.count_from(Side::Ask, ceiling);
+            let known = self.btree.count_from(Side::Ask, ceiling, MIN_KNOWN);
             if known < MIN_KNOWN {
                 return Some(format!(
                     "only {known} asks left below the synced ceiling {ceiling}"
@@ -908,6 +914,28 @@ mod tests {
         // 112..115 dropped (older), 116..120 straddles 118, 121..125 chains.
         assert!(matches!(app.phase, Phase::Live(125)));
         assert_eq!(book(&app), (vec![(99, 3), (98, 4)], vec![(104, 1)]));
+    }
+
+    /// A full-depth snapshot vouches only for its own price range. The
+    /// books re-sync on the update that leaves fewer than `MIN_KNOWN` known
+    /// levels on a side, not later.
+    #[test]
+    fn resyncs_before_leaving_the_synced_reach() {
+        let depth = crate::audit::SNAPSHOT_DEPTH as u32;
+        let bids: Vec<(u32, u64)> = (0..depth).map(|i| (10_999 - i, 1)).collect();
+        let asks: Vec<(u32, u64)> = (0..depth).map(|i| (20_000 + i, 1)).collect();
+        let mut app = app();
+        app.load_snapshot(snap(100, &bids, &asks));
+        // The market falls through the top bids: delete all but MIN_KNOWN of
+        // the snapshot's 1000 (the new top is still inside the reach).
+        let keep = MIN_KNOWN as u32;
+        let gone: Vec<(u32, u64)> = (10_000 + keep..=10_999).map(|t| (t, 0)).collect();
+        app.handle(ev(95, 105, 99, &gone, &[]));
+        assert!(matches!(app.phase, Phase::Live(105)));
+        // One more level gone: MIN_KNOWN - 1 left, so take a new snapshot.
+        app.handle(ev(106, 110, 105, &[(10_000 + keep - 1, 0)], &[]));
+        assert!(matches!(app.phase, Phase::Resync { .. }));
+        assert_eq!((app.resyncs, app.check_failures), (1, 0));
     }
 
     #[test]

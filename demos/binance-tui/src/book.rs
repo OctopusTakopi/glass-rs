@@ -230,11 +230,11 @@ impl GlassBook {
 
 impl BTreeBook {
     /// Levels of `side` from the best price back to `limit` inclusive (bids
-    /// at or above it, asks at or below it).
-    pub fn count_from(&self, side: Side, limit: u32) -> usize {
+    /// at or above it, asks at or below it), counting no further than `cap`.
+    pub fn count_from(&self, side: Side, limit: u32, cap: usize) -> usize {
         match side {
-            Side::Bid => self.bids.range(limit..).count(),
-            Side::Ask => self.asks.range(..=limit).count(),
+            Side::Bid => self.bids.range(limit..).take(cap).count(),
+            Side::Ask => self.asks.range(..=limit).take(cap).count(),
         }
     }
 
