@@ -9,7 +9,7 @@ keywords = ["order-book", "trie", "hft", "market-data", "data-structures"]
 categories = ["data-structures", "finance", "algorithms"]
 license = "MIT"
 edition = "2024"
-exclude = [".idea/", ".github/"]
+exclude = [".idea/", ".github/", "lean/"]
 
 [features]
 # Deprecated no-op, kept so existing `--features nightly` builds still work:

@@ -1,0 +1,5 @@
+name = "GlassProof"
+defaultTargets = ["GlassProof"]
+
+[[lean_lib]]
+name = "GlassProof"
